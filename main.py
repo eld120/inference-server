@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI
 
 from app import create_app
@@ -11,6 +12,7 @@ from config import RuntimeSettings
 
 
 def main() -> None:
+    load_dotenv()
     runtime = RuntimeSettings()
     parser = argparse.ArgumentParser(prog="inference-server")
     parser.add_argument("--config", default=str(runtime.config_path))
