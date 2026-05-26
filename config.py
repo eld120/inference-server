@@ -19,10 +19,12 @@ class RuntimeSettings(BaseSettings):
     config_path: Path = Field(default_factory=default_config_path)
     host: str = "0.0.0.0"
     port: int = 8000
-    llama_server_bin: str = "llama-server"
+    backend_port: int = 39281
     hf_token: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"),
+        validation_alias=AliasChoices(
+            "INF_HF_TOKEN", "HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"
+        ),
     )
 
 
