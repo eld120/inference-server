@@ -10,6 +10,8 @@ dependencies = [
     "huggingface-hub>=1.15.0",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.14.1",
+    "python-dotenv>=1.2.2",
+    "docker>=7.1.0",
     "uvicorn[standard]>=0.47.0",
 ]
 
