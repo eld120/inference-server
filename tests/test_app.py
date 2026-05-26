@@ -10,7 +10,13 @@ from httpx import Request as HTTPXRequest
 from app import create_app
 from manager import ProxySession
 from protocols import ActiveBackendProtocol
-from schemas import AppConfig, BackendStatus, ServiceStatus
+from schemas import (
+    AppConfig,
+    BackendStatus,
+    ModelPresetConfig,
+    ModelSource,
+    ServiceStatus,
+)
 
 
 class FakeManager:
@@ -40,6 +46,26 @@ class FakeManager:
         return SimpleNamespace(
             config=SimpleNamespace(name=self._backend.name),
         )
+
+    def find_backend_for_model(self, model_name: str) -> str | None:
+        if model_name == self._backend.name:
+            return self._backend.name
+        return None
+
+    def backends(self) -> list[ModelPresetConfig]:
+        return [
+            ModelPresetConfig(
+                name=self._backend.name,
+                model=ModelSource(local_path=Path("/models/dummy.gguf")),
+                backend_family="rocm",
+            )
+        ]
+
+    async def get_logs(self, name: str) -> list[str]:
+        return []
+
+    async def cleanup(self) -> None:
+        pass
 
     async def open_proxy_session(
         self,
@@ -83,10 +109,9 @@ async def test_app_routes_and_proxy(tmp_path: Path) -> None:
         active=True,
     )
     app = create_app(
-        app_config=AppConfig(backends=[], api_prefix="/api", hf_cache_dir=tmp_path),
+        app_config=AppConfig(models=[], api_prefix="/api", hf_cache_dir=tmp_path),
         manager=FakeManager(backend),
     )
-
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -94,7 +119,7 @@ async def test_app_routes_and_proxy(tmp_path: Path) -> None:
         status = await client.get("/api/status")
         proxied = await client.post(
             "/api/v1/chat/completions?foo=bar",
-            json={"model": "x"},
+            json={"model": "primary"},
         )
 
     assert health.json() == {"ok": True}

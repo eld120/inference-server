@@ -57,3 +57,8 @@ def test_resolve_source_downloads_repo_file(
 
     assert path == tmp_path / "model.gguf"
     assert calls[0] == ("repo/model", "model", "main", "token")
+
+
+def test_huggingface_service_initializes_api_with_token(tmp_path: Path) -> None:
+    service = HuggingFaceService(cache_dir=tmp_path, token="secret-token")
+    assert service._api.token == "secret-token"
