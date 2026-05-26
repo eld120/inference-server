@@ -12,7 +12,7 @@ from config import RuntimeSettings, effective_hf_token, load_app_config
 from hf import HuggingFaceService
 from manager import BackendManager
 from protocols import BackendManagerProtocol, HuggingFaceServiceProtocol
-from schemas import AppConfig, HFDownloadRequest, ModelSource
+from schemas import AppConfig
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -61,12 +61,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        if app_config.default_backend is not None:
-            await manager.load(app_config.default_backend)
         yield
-        active = manager.active_backend()
-        if active is not None:
-            await manager.unload(active.config.name)
+        await manager.cleanup()
 
     app = FastAPI(title="inference-server", lifespan=lifespan)
     app.state.manager = manager
@@ -105,44 +101,73 @@ def create_app(
             return JSONResponse({"ok": True})
         return JSONResponse(status.model_dump())
 
-    @app.get(f"{api_prefix}/hf/models")
-    async def hf_models(q: str | None = None, limit: int = 20) -> JSONResponse:
-        models = [
-            item.model_dump()
-            for item in await asyncio.to_thread(hf.search_models, q, limit)
-        ]
-        return JSONResponse({"models": models})
-
-    @app.get(f"{api_prefix}/hf/repos/{{repo_id:path}}/files")
-    async def hf_repo_files(repo_id: str, revision: str = "main") -> JSONResponse:
-        files = [
-            item.model_dump()
-            for item in await asyncio.to_thread(hf.repo_files, repo_id, revision)
-        ]
-        return JSONResponse({"files": files})
-
-    @app.get(f"{api_prefix}/hf/cache")
-    async def hf_cache() -> JSONResponse:
-        files = [item.model_dump() for item in await asyncio.to_thread(hf.cache_files)]
-        return JSONResponse({"files": files})
-
-    @app.post(f"{api_prefix}/hf/download")
-    async def hf_download(payload: HFDownloadRequest) -> JSONResponse:
+    @app.get(f"{api_prefix}/backends/{{name}}/logs")
+    async def backend_logs(name: str) -> JSONResponse:
         try:
-            result = await asyncio.to_thread(
-                hf.download,
-                ModelSource(
-                    repo_id=payload.repo_id,
-                    filename=payload.filename,
-                    revision=payload.revision,
-                ),
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return JSONResponse(result.model_dump())
+            logs = await manager.get_logs(name)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return JSONResponse({"name": name, "logs": logs})
+
+
 
     async def _proxy(request: Request, path: str) -> Response:
         body = await request.body()
+
+        # Extract model from JSON body
+        model_name: str | None = None
+        is_json = body and "application/json" in request.headers.get("content-type", "")
+        data = None
+        if is_json:
+            try:
+                import json
+
+                data = json.loads(body)
+                if isinstance(data, dict):
+                    model_name = data.get("model")
+            except Exception:
+                pass
+
+        target_backend: str | None = None
+        active = manager.active_backend()
+
+        if model_name:
+            # Verify model is configured
+            target_backend = manager.find_backend_for_model(model_name)
+            if target_backend is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Requested model '{model_name}' is not configured.",
+                )
+
+            # Verify configured model matches currently loaded model
+            if active is None or active.config.name != target_backend:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Model '{model_name}' is not currently loaded. "
+                        "Please call the load endpoint first."
+                    ),
+                )
+        else:
+            # No model specified: check if any model is loaded
+            if active is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No model is currently loaded.",
+                )
+            target_backend = active.config.name
+
+        # Rewrite model name in the JSON body so that the router routes it correctly
+        if target_backend and is_json and data is not None:
+            try:
+                import json
+
+                data["model"] = target_backend
+                body = json.dumps(data).encode("utf-8")
+            except Exception:
+                pass
+
         upstream_url = httpx.URL(
             f"http://placeholder/{path}",
             params=list(request.query_params.multi_items()),
@@ -155,8 +180,11 @@ def create_app(
         )
         try:
             session = await manager.open_proxy_session(f"/{path}", upstream_request)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except (RuntimeError, httpx.HTTPError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Backend communication failure: {exc}",
+            ) from exc
 
         upstream_response = session.response
         headers = _filtered_headers(upstream_response.headers)
@@ -168,8 +196,10 @@ def create_app(
                     async for chunk in upstream_response.aiter_raw():
                         yield chunk
                 finally:
-                    await upstream_response.aclose()
-                    await session.client.aclose()
+                    try:
+                        await asyncio.shield(upstream_response.aclose())
+                    finally:
+                        await asyncio.shield(session.client.aclose())
 
             return StreamingResponse(
                 iterator(),
@@ -187,8 +217,46 @@ def create_app(
                 media_type=content_type or None,
             )
         finally:
-            await upstream_response.aclose()
-            await session.client.aclose()
+            try:
+                await asyncio.shield(upstream_response.aclose())
+            finally:
+                await asyncio.shield(session.client.aclose())
+
+    @app.get(f"{api_prefix}/v1/models")
+    @app.get(f"{api_prefix}/v1/models/")
+    async def list_v1_models() -> JSONResponse:
+        import time
+        created_time = int(time.time())
+        data = [
+            {
+                "id": m.name,
+                "object": "model",
+                "created": created_time,
+                "owned_by": "inference-server",
+            }
+            for m in manager.backends()
+        ]
+        return JSONResponse({"object": "list", "data": data})
+
+    @app.get(f"{api_prefix}/v1/models/{{model_name}}")
+    async def retrieve_v1_model(model_name: str) -> JSONResponse:
+        import time
+        found = None
+        for m in manager.backends():
+            if m.name == model_name:
+                found = m
+                break
+        if found is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Model '{model_name}' not found in configuration.",
+            )
+        return JSONResponse({
+            "id": found.name,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "inference-server",
+        })
 
     @app.api_route(
         f"{api_prefix}/v1",

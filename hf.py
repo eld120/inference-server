@@ -23,7 +23,7 @@ class HuggingFaceService:
     ):
         self._cache_dir = cache_dir
         self._token = token
-        self._api = api or HfApi()
+        self._api = api or HfApi(token=self._token)
 
     @property
     def cache_dir(self) -> Path:
@@ -62,11 +62,19 @@ class HuggingFaceService:
         files: list[HFCachedFile] = []
         for repo in cached.repos:
             for file_info in repo.revisions:
+                # Gather all refs pointing to this commit hash
+                refs = []
+                for ref_name, rev_obj in repo.refs.items():
+                    val = getattr(rev_obj, "commit_hash", rev_obj)
+                    if val == file_info.commit_hash:
+                        refs.append(ref_name)
+
                 for sibling in file_info.files:
                     files.append(
                         HFCachedFile(
                             repo_id=repo.repo_id,
                             revision=file_info.commit_hash,
+                            refs=refs,
                             filename=sibling.file_name,
                             local_path=str(sibling.file_path),
                             size_on_disk=sibling.size_on_disk,
