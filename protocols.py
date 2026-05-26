@@ -7,12 +7,12 @@ from typing import Protocol
 import httpx
 
 from schemas import (
-    BackendConfig,
     BackendStatus,
     HFCachedFile,
     HFDownloadResponse,
     HFRepoFile,
     HFSearchResult,
+    ModelPresetConfig,
     ModelSource,
     ServiceStatus,
 )
@@ -34,6 +34,8 @@ class HFApiProtocol(Protocol):
 
 
 class ModelResolverProtocol(Protocol):
+    cache_dir: Path
+
     def resolve_source(self, source: ModelSource) -> Path: ...
 
 
@@ -55,7 +57,7 @@ class ProxySessionProtocol(Protocol):
 
 
 class ActiveBackendProtocol(Protocol):
-    config: BackendConfig
+    config: ModelPresetConfig
 
 
 class BackendManagerProtocol(Protocol):
@@ -72,3 +74,11 @@ class BackendManagerProtocol(Protocol):
     async def open_proxy_session(
         self, path: str, request: httpx.Request
     ) -> ProxySessionProtocol: ...
+
+    async def get_logs(self, name: str) -> list[str]: ...
+
+    async def cleanup(self) -> None: ...
+
+    def find_backend_for_model(self, model_name: str) -> str | None: ...
+
+    def backends(self) -> list[ModelPresetConfig]: ...
