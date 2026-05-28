@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import docker
 import docker.errors
@@ -15,34 +16,38 @@ import huggingface_hub
 
 from config import RuntimeSettings
 from protocols import (
-    ActiveBackendProtocol,
+    ActiveModelProtocol,
     ModelResolverProtocol,
     ProxySessionProtocol,
 )
 from schemas import (
     AppConfig,
-    BackendFamilyConfig,
-    BackendState,
-    BackendStatus,
-    ModelPresetConfig,
+    RuntimeState,
+    ModelConfig,
+    ModelResource,
     ModelSource,
+    ModelStatus,
+    RuntimeConfig,
     ServiceStatus,
+    SpeculativeConfig,
 )
 
 logger = logging.getLogger(__name__)
 
 
-class BackendRuntime:
+class RuntimeContainer:
     def __init__(
         self,
-        preset: ModelPresetConfig,
-        family: BackendFamilyConfig,
-        manager: BackendManager,
+        runtime_type: str,
+        model_name: str,
+        rt_cfg: RuntimeConfig,
+        manager: ModelRuntimeManager,
     ) -> None:
-        self.config = preset
-        self.family_config = family
+        self.runtime_type = runtime_type
+        self.model_name = model_name
+        self.config = rt_cfg
         self.manager = manager
-        self.state: BackendState = "stopped"
+        self.state: RuntimeState = "stopped"
         self.container: docker.models.containers.Container | None = None
         self.last_error: str | None = None
         self.model_path: Path | None = None
@@ -51,10 +56,148 @@ class BackendRuntime:
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.config.connect_host}:{self.manager.backend_port}"
+        return f"http://{self.config.connect_host}:{self.manager.runtime_port}"
+
+    @property
+    def docker_image(self) -> str:
+        return self.config.docker_image
+
+    @property
+    def devices(self) -> list[str]:
+        return self.config.devices
+
+    @property
+    def volumes(self) -> dict[str, str]:
+        return self.config.volumes
+
+    @property
+    def bind_host(self) -> str:
+        return self.config.bind_host
+
+    @property
+    def connect_host(self) -> str:
+        return self.config.connect_host
+
+    @property
+    def shared_args(self) -> list[str]:
+        return self.config.shared_args
+
+    @property
+    def extra_args(self) -> list[str]:
+        return self.config.extra_args
+
+    @property
+    def speculative(self) -> SpeculativeConfig:
+        return self.config.speculative
 
     async def start(self) -> None:
-        raise NotImplementedError
+        self.state = "starting"
+        self.last_error = None
+        try:
+            # 1. Generate models preset INI file on host
+            ini_content = await self.manager._generate_presets_ini(
+                self.runtime_type,
+                active_model_name=self.model_name,
+                active_model_resolved_path=self.model_path,
+                active_model_draft_resolved_path=self.draft_model_path,
+            )
+            ini_dir = self.manager._hf.cache_dir / "presets"
+            await asyncio.to_thread(ini_dir.mkdir, parents=True, exist_ok=True)
+            ini_path = ini_dir / f"{self.runtime_type}.ini"
+            await asyncio.to_thread(ini_path.write_text, ini_content)
+
+            await self._ensure_image_pulled()
+
+            # 2. Gather volume bindings (always mount HF cache and local parents)
+            volumes = {
+                str(self.manager._hf.cache_dir.resolve().absolute()): {
+                    "bind": "/huggingface",
+                    "mode": "ro",
+                }
+            }
+            # Mount host directory containing presets
+            volumes[str(ini_dir.resolve().absolute())] = {
+                "bind": "/config",
+                "mode": "ro",
+            }
+
+            for m in self.manager._config.models:
+                if self.runtime_type in m.runtimes:
+                    rt_cfg = m.runtimes[self.runtime_type]
+                    if rt_cfg.source.local_path is not None:
+                        local_p = Path(rt_cfg.source.local_path).resolve().absolute()
+                        cache_dir = self.manager._hf.cache_dir.resolve().absolute()
+                        if not local_p.is_relative_to(cache_dir):
+                            parent = local_p.parent
+                            suffix = self.manager._dir_hash(parent)
+                            bind_path = f"/local_models_{suffix}"
+                            volumes[str(parent)] = {
+                                "bind": bind_path,
+                                "mode": "ro",
+                            }
+                    if (
+                        rt_cfg.speculative.draft_model is not None
+                        and rt_cfg.speculative.draft_model.local_path is not None
+                    ):
+                        local_p = (
+                            Path(rt_cfg.speculative.draft_model.local_path)
+                            .resolve()
+                            .absolute()
+                        )
+                        cache_dir = self.manager._hf.cache_dir.resolve().absolute()
+                        if not local_p.is_relative_to(cache_dir):
+                            parent = local_p.parent
+                            suffix = self.manager._dir_hash(parent)
+                            bind_path = f"/local_models_{suffix}"
+                            volumes[str(parent)] = {
+                                "bind": bind_path,
+                                "mode": "ro",
+                            }
+
+            # Apply runtime specific custom mounts
+            for src, dst in self.volumes.items():
+                abs_src = str(Path(src).resolve().absolute())
+                volumes[abs_src] = {"bind": dst, "mode": "ro"}
+
+            # Port & GPU setups
+            ports = {"8080/tcp": (self.bind_host, self.manager.runtime_port)}
+            devices = [f"{d}:{d}" for d in self.devices]
+
+            # Start llama-server: load via --models-preset
+            command = [
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "8080",
+                "--models-preset",
+                f"/config/{self.runtime_type}.ini",
+            ]
+            command.extend(self.shared_args)
+
+            container_name = f"inference-server-runtime-{self.runtime_type}"
+            await self.manager._remove_conflicting_container(container_name)
+
+            self.container = await asyncio.to_thread(
+                self.manager.docker_client.containers.run,
+                image=self.docker_image,
+                command=command,
+                devices=devices,
+                ports=ports,
+                volumes=volumes,
+                detach=True,
+                name=container_name,
+                auto_remove=True,
+                labels={"managed-by": "inference-server"},
+            )
+            self.started_at = datetime.now(tz=UTC)
+            await self._wait_until_ready()
+            self.state = "running"
+        except Exception as exc:
+            self.state = "error"
+            self.last_error = str(exc)
+            await self.stop()
+            self.state = "error"
+            raise
 
     async def stop(self) -> None:
         container = self.container
@@ -62,8 +205,6 @@ class BackendRuntime:
             return
         self.state = "stopping"
         try:
-            # Authoritative stop semantics:
-            # Try a graceful stop, fallback to force remove if it fails/times out
             logger.info("Stopping container: %s", container.name)
             await asyncio.to_thread(container.stop, timeout=10)
             self.container = None
@@ -81,10 +222,20 @@ class BackendRuntime:
                 raise rm_exc
 
     async def load_model(self, name: str) -> None:
-        raise NotImplementedError
+        async with self.manager.create_proxy_client(self.base_url) as client:
+            response = await client.post("/models/load", json={"model": name})
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"Failed to load model inside runtime container: {response.text}"
+                )
 
     async def unload_model(self, name: str) -> None:
-        raise NotImplementedError
+        async with self.manager.create_proxy_client(self.base_url) as client:
+            response = await client.post("/models/unload", json={"model": name})
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"Failed to unload model inside runtime container: {response.text}"
+                )
 
     async def get_logs(self) -> list[str]:
         container = self.container
@@ -97,7 +248,7 @@ class BackendRuntime:
             return []
 
     async def _ensure_image_pulled(self) -> None:
-        image = self.family_config.docker_image
+        image = self.docker_image
         try:
             await asyncio.to_thread(self.manager.docker_client.images.get, image)
         except docker.errors.ImageNotFound:
@@ -137,258 +288,10 @@ class BackendRuntime:
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
             await asyncio.sleep(1)
-        msg = "backend did not become ready in time"
+        msg = "runtime did not become ready in time"
         if last_error is not None:
             raise TimeoutError(msg) from last_error
         raise TimeoutError(msg)
-
-
-class ContainerRuntime(BackendRuntime):
-    async def start(self) -> None:
-        self.state = "starting"
-        self.last_error = None
-        try:
-            # 1. Resolve model sources on host
-            model_path = await asyncio.to_thread(
-                self.manager._hf.resolve_source, self.config.model
-            )
-            draft_model_path = None
-            if self.config.speculative.draft_model is not None:
-                draft_model_path = await asyncio.to_thread(
-                    self.manager._hf.resolve_source,
-                    self.config.speculative.draft_model,
-                )
-
-            self.model_path = Path(model_path).resolve().absolute()
-            if draft_model_path is not None:
-                self.draft_model_path = Path(draft_model_path).resolve().absolute()
-
-            await self._ensure_image_pulled()
-
-            # 2. Setup volume binds
-            host_model_dir = str(self.model_path.parent)
-            container_model_path = f"/models/{self.model_path.name}"
-            volumes = {host_model_dir: {"bind": "/models", "mode": "ro"}}
-
-            container_draft_model_path = None
-            if self.draft_model_path is not None:
-                if self.draft_model_path.parent == self.model_path.parent:
-                    container_draft_model_path = f"/models/{self.draft_model_path.name}"
-                else:
-                    volumes[str(self.draft_model_path.parent)] = {
-                        "bind": "/draft_models",
-                        "mode": "ro",
-                    }
-                    container_draft_model_path = (
-                        f"/draft_models/{self.draft_model_path.name}"
-                    )
-
-            # Apply family specific custom mounts
-            for src, dst in self.family_config.volumes.items():
-                abs_src = str(Path(src).resolve().absolute())
-                volumes[abs_src] = {"bind": dst, "mode": "ro"}
-
-            # Setup Port mappings & Devices
-            ports = {"8080/tcp": (self.config.bind_host, self.manager.backend_port)}
-            devices = [f"{d}:{d}" for d in self.family_config.devices]
-
-            # Build direct model launch command
-            command = [
-                "--host",
-                "0.0.0.0",
-                "--port",
-                "8080",
-                "-m",
-                container_model_path,
-            ]
-            if self.config.speculative.type != "none":
-                command.extend(["--spec-type", self.config.speculative.type])
-            if container_draft_model_path is not None:
-                command.extend(["-md", container_draft_model_path])
-
-            # Ensure GPU offload defaults match between strategies
-            # (default to -ngl 99 if not specified)
-            has_gpu_offload = any(
-                arg.split("=")[0] in ["-ngl", "--n-gpu-layers", "--gpu-layers"]
-                for arg in (self.family_config.shared_args + self.config.extra_args)
-            )
-            if not has_gpu_offload:
-                command.extend(["-ngl", "99"])
-
-            command.extend(self.family_config.shared_args)
-            command.extend(self.config.extra_args)
-
-            container_name = f"inference-server-{self.config.name}"
-            await self.manager._remove_conflicting_container(container_name)
-
-            self.container = await asyncio.to_thread(
-                self.manager.docker_client.containers.run,
-                image=self.family_config.docker_image,
-                command=command,
-                devices=devices,
-                ports=ports,
-                volumes=volumes,
-                detach=True,
-                name=container_name,
-                auto_remove=True,
-                labels={"managed-by": "inference-server"},
-            )
-            self.started_at = datetime.now(tz=UTC)
-            await self._wait_until_ready()
-            self.state = "running"
-        except Exception as exc:
-            self.state = "error"
-            self.last_error = str(exc)
-            await self.stop()
-            self.state = "error"
-            raise
-
-    async def load_model(self, name: str) -> None:
-        # For Container strategy, starting the container loads the model
-        pass
-
-    async def unload_model(self, name: str) -> None:
-        # Unloading the model stops the container
-        await self.stop()
-
-
-class RouterRuntime(BackendRuntime):
-    def __init__(
-        self,
-        preset: ModelPresetConfig,
-        family: BackendFamilyConfig,
-        manager: BackendManager,
-        family_name: str,
-    ) -> None:
-        super().__init__(preset, family, manager)
-        self.backend_family = family_name
-
-    async def start(self) -> None:
-        self.state = "starting"
-        self.last_error = None
-        try:
-            # 1. Generate models preset INI file on host
-            ini_content = await self.manager._generate_presets_ini(
-                self.backend_family,
-                active_preset_name=self.config.name,
-                active_preset_resolved_path=self.model_path,
-                active_preset_draft_resolved_path=self.draft_model_path,
-            )
-            ini_dir = self.manager._hf.cache_dir / "presets"
-            await asyncio.to_thread(ini_dir.mkdir, parents=True, exist_ok=True)
-            ini_path = ini_dir / f"{self.backend_family}.ini"
-            await asyncio.to_thread(ini_path.write_text, ini_content)
-
-            await self._ensure_image_pulled()
-
-            # 2. Gather volume bindings (always mount HF cache and local parents)
-            volumes = {
-                str(self.manager._hf.cache_dir.resolve().absolute()): {
-                    "bind": "/huggingface",
-                    "mode": "ro",
-                }
-            }
-            # Mount host directory containing presets
-            volumes[str(ini_dir.resolve().absolute())] = {
-                "bind": "/config",
-                "mode": "ro",
-            }
-
-            for m in self.manager._config.models:
-                if m.backend_family == self.backend_family:
-                    if m.model.local_path is not None:
-                        local_p = Path(m.model.local_path).resolve().absolute()
-                        cache_dir = self.manager._hf.cache_dir.resolve().absolute()
-                        if not local_p.is_relative_to(cache_dir):
-                            parent = local_p.parent
-                            suffix = self.manager._dir_hash(parent)
-                            bind_path = f"/local_models_{suffix}"
-                            volumes[str(parent)] = {
-                                "bind": bind_path,
-                                "mode": "ro",
-                            }
-                    # Resolve speculative draft model local parent directories
-                    if (
-                        m.speculative.draft_model is not None
-                        and m.speculative.draft_model.local_path is not None
-                    ):
-                        local_p = (
-                            Path(m.speculative.draft_model.local_path)
-                            .resolve()
-                            .absolute()
-                        )
-                        cache_dir = self.manager._hf.cache_dir.resolve().absolute()
-                        if not local_p.is_relative_to(cache_dir):
-                            parent = local_p.parent
-                            suffix = self.manager._dir_hash(parent)
-                            bind_path = f"/local_models_{suffix}"
-                            volumes[str(parent)] = {
-                                "bind": bind_path,
-                                "mode": "ro",
-                            }
-
-            # Apply family specific custom mounts
-            for src, dst in self.family_config.volumes.items():
-                abs_src = str(Path(src).resolve().absolute())
-                volumes[abs_src] = {"bind": dst, "mode": "ro"}
-
-            # Port & GPU setups
-            ports = {"8080/tcp": (self.config.bind_host, self.manager.backend_port)}
-            devices = [f"{d}:{d}" for d in self.family_config.devices]
-
-            # Start router mode: load via --models-preset and do not specify -m
-            command = [
-                "--host",
-                "0.0.0.0",
-                "--port",
-                "8080",
-                "--models-preset",
-                f"/config/{self.backend_family}.ini",
-            ]
-            command.extend(self.family_config.shared_args)
-
-            container_name = f"inference-server-router-{self.backend_family}"
-            await self.manager._remove_conflicting_container(container_name)
-
-            self.container = await asyncio.to_thread(
-                self.manager.docker_client.containers.run,
-                image=self.family_config.docker_image,
-                command=command,
-                devices=devices,
-                ports=ports,
-                volumes=volumes,
-                detach=True,
-                name=container_name,
-                auto_remove=True,
-                labels={"managed-by": "inference-server"},
-            )
-            self.started_at = datetime.now(tz=UTC)
-            await self._wait_until_ready()
-            self.state = "running"
-        except Exception as exc:
-            self.state = "error"
-            self.last_error = str(exc)
-            await self.stop()
-            self.state = "error"
-            raise
-
-    async def load_model(self, name: str) -> None:
-        # Explicitly post load to the router container
-        async with self.manager.create_proxy_client(self.base_url) as client:
-            response = await client.post("/models/load", json={"model": name})
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"Failed to load model inside router: {response.text}"
-                )
-
-    async def unload_model(self, name: str) -> None:
-        # Explicitly post unload to the router container
-        async with self.manager.create_proxy_client(self.base_url) as client:
-            response = await client.post("/models/unload", json={"model": name})
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"Failed to unload model inside router: {response.text}"
-                )
 
 
 @dataclass(slots=True)
@@ -397,7 +300,25 @@ class ProxySession:
     response: httpx.Response
 
 
-class BackendManager:
+class ActiveModel:
+    def __init__(self, name: str, model_config: ModelConfig, runtime: str) -> None:
+        self.model_config = model_config
+        self.runtime = runtime
+
+    @property
+    def config(self):
+        rt_cfg = self.model_config.runtimes[self.runtime]
+        return SimpleNamespace(
+            name=self.model_config.name,
+            model=rt_cfg.source,
+            speculative=rt_cfg.speculative,
+            extra_args=rt_cfg.extra_args,
+            bind_host=rt_cfg.bind_host,
+            connect_host=rt_cfg.connect_host,
+        )
+
+
+class ModelRuntimeManager:
     def __init__(
         self,
         runtime: RuntimeSettings,
@@ -413,13 +334,13 @@ class BackendManager:
         )
         self._lock = asyncio.Lock()
         self._active_model_name: str | None = None
-        self._active_family: str | None = None
-        self._active_runtime: BackendRuntime | None = None
+        self._active_runtime: RuntimeContainer | None = None
         self._docker_client: docker.DockerClient | None = None
 
     @staticmethod
     def _dir_hash(parent: Path) -> str:
         import hashlib
+
         return hashlib.md5(str(parent).encode()).hexdigest()[:8]
 
     @property
@@ -429,8 +350,8 @@ class BackendManager:
         return self._docker_client
 
     @property
-    def backend_port(self) -> int:
-        return self._runtime.backend_port
+    def runtime_port(self) -> int:
+        return self._runtime.runtime_port
 
     @staticmethod
     def _default_client_factory(base_url: str) -> httpx.AsyncClient:
@@ -439,277 +360,302 @@ class BackendManager:
             timeout=httpx.Timeout(60.0, read=None),
         )
 
-    def backends(self) -> list[ModelPresetConfig]:
+    def models(self) -> list[ModelConfig]:
         return list(self._config.models)
 
-    def backend_statuses(self) -> list[BackendStatus]:
+    def model_statuses(self) -> list[ModelStatus]:
         return [self._to_status(model_config) for model_config in self._config.models]
 
-    def _to_status(self, model_config: ModelPresetConfig) -> BackendStatus:
+    def _to_status(self, model_config: ModelConfig) -> ModelStatus:
         is_current = (
             self._active_runtime is not None
-            and self._active_runtime.config.name == model_config.name
+            and self._active_runtime.model_name == model_config.name
         )
         active = self._active_model_name == model_config.name
-        state: BackendState = "stopped"
+        state: RuntimeState = "stopped"
         container_id: str | None = None
         last_error: str | None = None
         model_path: str | None = None
         draft_model_path: str | None = None
+        active_runtime: str | None = None
 
-        if is_current and self._active_runtime is not None:
-            # In Router mode, the container might be running, but if this preset
-            # is not the active model, then the preset is stopped/unloaded.
-            if (
-                isinstance(self._active_runtime, RouterRuntime)
-                and self._active_runtime.state == "running"
-                and not active
-            ):
-                state = "stopped"
-            else:
-                state = self._active_runtime.state
-                last_error = self._active_runtime.last_error
-                container_id = (
-                    None
-                    if self._active_runtime.container is None
-                    else self._active_runtime.container.id
-                )
-                model_path = (
-                    None
-                    if self._active_runtime.model_path is None
-                    else str(self._active_runtime.model_path)
-                )
-                draft_model_path = (
-                    None
-                    if self._active_runtime.draft_model_path is None
-                    else str(self._active_runtime.draft_model_path)
-                )
+        if self._active_runtime is not None:
+            active_runtime = self._active_runtime.runtime_type
+            if is_current:
+                if self._active_runtime.state == "running" and not active:
+                    state = "stopped"
+                else:
+                    state = self._active_runtime.state
+                    last_error = self._active_runtime.last_error
+                    if active:
+                        container_id = (
+                            None
+                            if self._active_runtime.container is None
+                            else self._active_runtime.container.id
+                        )
+                        model_path = (
+                            None
+                            if self._active_runtime.model_path is None
+                            else str(self._active_runtime.model_path)
+                        )
+                        draft_model_path = (
+                            None
+                            if self._active_runtime.draft_model_path is None
+                            else str(self._active_runtime.draft_model_path)
+                        )
 
-        return BackendStatus(
+        active_rt = active_runtime if active else None
+        first_rt_name = list(model_config.runtimes.keys())[0]
+        rt_cfg = model_config.runtimes[first_rt_name]
+        if active_rt and active_rt in model_config.runtimes:
+            rt_cfg = model_config.runtimes[active_rt]
+
+        # Get model label:
+        model_label = "unconfigured"
+        if active_rt and active_rt in model_config.runtimes:
+            model_label = model_config.runtimes[active_rt].source.label()
+        elif model_config.runtimes:
+            model_label = model_config.runtimes[first_rt_name].source.label()
+
+        # Get speculative type:
+        spec_type = "none"
+        if active_rt and active_rt in model_config.runtimes:
+            spec_type = model_config.runtimes[active_rt].speculative.type
+        elif model_config.runtimes:
+            spec_type = model_config.runtimes[first_rt_name].speculative.type
+
+        return ModelStatus(
             name=model_config.name,
             state=state,
-            model=model_config.model.label(),
-            speculative_type=model_config.speculative.type,
-            host=model_config.connect_host,
-            port=self.backend_port,
+            active=active,
+            active_runtime=active_rt,
+            model=model_label,
+            speculative_type=spec_type,
+            host=rt_cfg.connect_host,
+            port=self.runtime_port,
             container_id=container_id,
             last_error=last_error,
             model_path=model_path,
             draft_model_path=draft_model_path,
-            base_url=f"http://{model_config.connect_host}:{self.backend_port}",
-            active=active,
+            base_url=f"http://{rt_cfg.connect_host}:{self.runtime_port}",
         )
+
+    def _to_resource(self, model_config: ModelConfig) -> ModelResource:
+        return ModelResource(
+            name=model_config.name,
+            config=model_config,
+            status=self._to_status(model_config),
+        )
+
+    def model_resources(self) -> list[ModelResource]:
+        return [self._to_resource(model_config) for model_config in self._config.models]
+
+    def model_resource(self, name: str) -> ModelResource:
+        return self._to_resource(self._get_model_config(name))
 
     def status(self) -> ServiceStatus:
         healthy = True
-        if self._active_runtime is not None and self._active_runtime.state == "error":
-            healthy = False
+        active_container_id = None
+        last_error = None
+        active_runtime = None
+        if self._active_runtime is not None:
+            if self._active_runtime.state == "error":
+                healthy = False
+            last_error = self._active_runtime.last_error
+            active_runtime = self._active_runtime.runtime_type
+            if self._active_runtime.container is not None:
+                active_container_id = self._active_runtime.container.id
+
         return ServiceStatus(
             healthy=healthy,
             api_prefix=self._config.api_prefix,
-            active_backend=self._active_model_name,
-            backends=self.backend_statuses(),
+            config_path=str(self._runtime.config_path),
+            active_model=self._active_model_name,
+            active_runtime=active_runtime,
+            active_container_id=active_container_id,
+            last_error=last_error,
+            models=self.model_resources(),
         )
 
-    def _get_preset(self, name: str) -> ModelPresetConfig:
+    def _get_model_config(self, name: str) -> ModelConfig:
         for m in self._config.models:
             if m.name == name:
                 return m
-        msg = f"unknown backend: {name}"
+        msg = f"unknown model: {name}"
         raise KeyError(msg)
 
-    async def load(self, name: str) -> BackendStatus:
+    async def load(self, name: str, runtime: str) -> ModelResource:
         async with self._lock:
-            # 1. Resolve target preset config
-            preset = self._get_preset(name)
-            family_name = preset.backend_family
-            family_config = self._config.backend_families.get(family_name)
-            if family_config is None:
-                msg = f"unknown backend family: {family_name}"
-                raise ValueError(msg)
-
-            # Determine runtime strategy class
-            mode = self._config.runtime_mode
-            if mode == "router":
-                runtime_class: type[BackendRuntime] = RouterRuntime
-            elif mode == "container":
-                runtime_class = ContainerRuntime
-            else:
-                # auto mode
-                if family_config.router_supported:
-                    runtime_class = RouterRuntime
-                else:
-                    runtime_class = ContainerRuntime
+            # 1. Resolve target model config
+            model_cfg = self._get_model_config(name)
+            if runtime not in model_cfg.runtimes:
+                raise ValueError(f"model '{name}' does not support runtime '{runtime}'")
+            rt_cfg = model_cfg.runtimes[runtime]
 
             # 2. Check if running container is already active and compatible
             is_compatible = (
                 self._active_runtime is not None
-                and self._active_family == family_name
-                and type(self._active_runtime) is runtime_class
-                and self._active_runtime.config.bind_host == preset.bind_host
-                and self._active_runtime.config.connect_host == preset.connect_host
+                and self._active_runtime.runtime_type == runtime
+                and self._active_runtime.docker_image == rt_cfg.docker_image
+                and self._active_runtime.devices == rt_cfg.devices
+                and self._active_runtime.volumes == rt_cfg.volumes
+                and self._active_runtime.bind_host == rt_cfg.bind_host
+                and self._active_runtime.connect_host == rt_cfg.connect_host
+                and self._active_runtime.shared_args == rt_cfg.shared_args
             )
 
             if is_compatible and self._active_runtime is not None:
                 if self._active_model_name == name:
-                    return self._to_status(preset)
+                    return self._to_resource(model_cfg)
 
-                # Swap the model on the existing router container
-                if runtime_class is RouterRuntime:
-                    # 1. Always unload the old model first
-                    if self._active_model_name:
-                        try:
-                            await self._active_runtime.unload_model(
-                                self._active_model_name
-                            )
-                        except Exception as exc:
-                            self._active_runtime.state = "error"
-                            self._active_runtime.last_error = str(exc)
-                            self._active_model_name = None
-                            raise
-                        self._active_model_name = None
-
-                    # 2. Update config to the target preset so that status()
-                    # correctly associates errors with the target preset
-                    self._active_runtime.config = preset
-
+                # Swap the model on the existing runtime container
+                # 1. Always unload the old model first
+                if self._active_model_name:
                     try:
-                        # 3. Resolve and download the new model and draft model
-                        model_path = await asyncio.to_thread(
-                            self._hf.resolve_source, preset.model
-                        )
-                        draft_model_path = None
-                        if preset.speculative.draft_model is not None:
-                            draft_model_path = await asyncio.to_thread(
-                                self._hf.resolve_source,
-                                preset.speculative.draft_model,
-                            )
-
-                        self._active_runtime.model_path = (
-                            Path(model_path).resolve().absolute()
-                        )
-                        if draft_model_path is not None:
-                            self._active_runtime.draft_model_path = (
-                                Path(draft_model_path).resolve().absolute()
-                            )
-                        else:
-                            self._active_runtime.draft_model_path = None
-
-                        # 4. Regenerate presets INI file with target preset path
-                        ini_content = await self._generate_presets_ini(
-                            family_name=family_name,
-                            active_preset_name=name,
-                            active_preset_resolved_path=(
-                                self._active_runtime.model_path
-                            ),
-                            active_preset_draft_resolved_path=(
-                                self._active_runtime.draft_model_path
-                            ),
-                        )
-                        ini_dir = self._hf.cache_dir / "presets"
-                        await asyncio.to_thread(
-                            ini_dir.mkdir, parents=True, exist_ok=True
-                        )
-                        ini_path = ini_dir / f"{family_name}.ini"
-                        await asyncio.to_thread(ini_path.write_text, ini_content)
-
-                        # 5. Load the model on the router
-                        await self._active_runtime.load_model(name)
-                        self._active_model_name = name
+                        await self._active_runtime.unload_model(self._active_model_name)
                     except Exception as exc:
                         self._active_runtime.state = "error"
                         self._active_runtime.last_error = str(exc)
                         self._active_model_name = None
                         raise
+                    self._active_model_name = None
 
-                    return self._to_status(preset)
+                # 2. Update config to target model
+                self._active_runtime.model_name = name
+                self._active_runtime.config = rt_cfg
+
+                try:
+                    # 3. Resolve and download the new model and draft model
+                    model_path = await asyncio.to_thread(
+                        self._hf.resolve_source, rt_cfg.source
+                    )
+                    draft_model_path = None
+                    if rt_cfg.speculative.draft_model is not None:
+                        draft_model_path = await asyncio.to_thread(
+                            self._hf.resolve_source,
+                            rt_cfg.speculative.draft_model,
+                        )
+
+                    self._active_runtime.model_path = (
+                        Path(model_path).resolve().absolute()
+                    )
+                    if draft_model_path is not None:
+                        self._active_runtime.draft_model_path = (
+                            Path(draft_model_path).resolve().absolute()
+                        )
+                    else:
+                        self._active_runtime.draft_model_path = None
+
+                    # 4. Regenerate presets INI file with target model path
+                    ini_content = await self._generate_presets_ini(
+                        runtime_type=runtime,
+                        active_model_name=name,
+                        active_model_resolved_path=(self._active_runtime.model_path),
+                        active_model_draft_resolved_path=(
+                            self._active_runtime.draft_model_path
+                        ),
+                    )
+                    ini_dir = self._hf.cache_dir / "presets"
+                    await asyncio.to_thread(ini_dir.mkdir, parents=True, exist_ok=True)
+                    ini_path = ini_dir / f"{runtime}.ini"
+                    await asyncio.to_thread(ini_path.write_text, ini_content)
+
+                    # 5. Load the model on the runtime
+                    await self._active_runtime.load_model(name)
+                    self._active_model_name = name
+                except Exception as exc:
+                    self._active_runtime.state = "error"
+                    self._active_runtime.last_error = str(exc)
+                    self._active_model_name = None
+                    raise
+
+                return self._to_resource(model_cfg)
 
             # 3. Not compatible. Stop current active runtime if running
             if self._active_runtime is not None:
+                if self._active_model_name:
+                    try:
+                        await self._active_runtime.unload_model(self._active_model_name)
+                    except Exception:
+                        pass
                 await self._active_runtime.stop()
                 self._active_runtime = None
                 self._active_model_name = None
-                self._active_family = None
 
             # Clean up any other running managed containers
             # (e.g. orphans from previous crashes)
             await self._cleanup_all_managed_containers()
 
             # 4. Initialize and start new runtime
-            if runtime_class is RouterRuntime:
-                runtime = RouterRuntime(preset, family_config, self, family_name)
-            else:
-                runtime = ContainerRuntime(preset, family_config, self)
+            runtime_obj = RuntimeContainer(runtime, name, rt_cfg, self)
 
-            self._active_runtime = runtime
-            self._active_family = family_name
+            self._active_runtime = runtime_obj
 
             try:
-                # For Router mode, resolve paths *before* starting the runtime
-                # so that the models are already downloaded and cached
-                # before generating the INI file
-                if runtime_class is RouterRuntime:
-                    model_path = await asyncio.to_thread(
-                        self._hf.resolve_source, preset.model
+                # Resolve paths before starting the runtime
+                model_path = await asyncio.to_thread(
+                    self._hf.resolve_source, rt_cfg.source
+                )
+                draft_model_path = None
+                if rt_cfg.speculative.draft_model is not None:
+                    draft_model_path = await asyncio.to_thread(
+                        self._hf.resolve_source, rt_cfg.speculative.draft_model
                     )
-                    draft_model_path = None
-                    if preset.speculative.draft_model is not None:
-                        draft_model_path = await asyncio.to_thread(
-                            self._hf.resolve_source, preset.speculative.draft_model
-                        )
 
-                    runtime.model_path = Path(model_path).resolve().absolute()
-                    if draft_model_path is not None:
-                        runtime.draft_model_path = (
-                            Path(draft_model_path).resolve().absolute()
-                        )
-                    
-                    pass
+                runtime_obj.model_path = Path(model_path).resolve().absolute()
+                if draft_model_path is not None:
+                    runtime_obj.draft_model_path = (
+                        Path(draft_model_path).resolve().absolute()
+                    )
 
-                await runtime.start()
-
-                if runtime_class is RouterRuntime:
-                    await runtime.load_model(name)
+                await runtime_obj.start()
+                await runtime_obj.load_model(name)
 
                 self._active_model_name = name
-                return self._to_status(preset)
+                return self._to_resource(model_cfg)
             except Exception as exc:
                 logger.error(
-                    "Failed to start/load runtime for preset %s: %s", name, exc
+                    "Failed to start/load runtime for model %s: %s", name, exc
                 )
                 try:
-                    await runtime.stop()
+                    await runtime_obj.stop()
                 except Exception as stop_exc:
                     logger.error(
                         "Failed to stop runtime after start/load failure: %s",
                         stop_exc,
                     )
-                
-                # Keep active runtime reference to expose the error state via status()
-                runtime.state = "error"
-                runtime.last_error = str(exc)
+
+                runtime_obj.state = "error"
+                runtime_obj.last_error = str(exc)
                 self._active_model_name = None
                 raise
 
-    async def unload(self, name: str | None = None) -> BackendStatus | None:
+    async def unload(self, name: str | None = None) -> ModelResource | None:
         async with self._lock:
             target_name = name or self._active_model_name
             if target_name is None or self._active_model_name != target_name:
                 return None
 
-            preset = self._get_preset(target_name)
+            model_cfg = self._get_model_config(target_name)
             if self._active_runtime is not None:
-                await self._active_runtime.unload_model(target_name)
+                try:
+                    await self._active_runtime.unload_model(target_name)
+                except Exception as unload_exc:
+                    try:
+                        await self._active_runtime.stop()
+                        self._active_runtime = None
+                        self._active_model_name = None
+                    except Exception:
+                        pass
+                    raise unload_exc
 
-            # If Container mode, stopping is handled during unload.
-            # In Router mode, we keep the router container running but
-            # unset active state.
-            if type(self._active_runtime) is ContainerRuntime:
+                await self._active_runtime.stop()
                 self._active_runtime = None
-                self._active_family = None
+                self._active_model_name = None
+            else:
+                self._active_model_name = None
 
-            self._active_model_name = None
-            return self._to_status(preset)
+            return self._to_resource(model_cfg)
 
     async def _remove_conflicting_container(self, name: str) -> None:
         try:
@@ -722,7 +668,6 @@ class BackendManager:
             pass
 
     async def _resolve_commit_hash(self, repo_id: str, revision: str = "main") -> str:
-        # Query commit hash (revision sha) from HF hub
         token = getattr(self._hf, "_token", None)
         try:
             info = await asyncio.to_thread(
@@ -733,7 +678,6 @@ class BackendManager:
         except Exception:
             pass
 
-        # Local cache scan fallback
         try:
             repo_escaped = "models--" + repo_id.replace("/", "--")
             snapshots_dir = self._hf.cache_dir / repo_escaped / "snapshots"
@@ -755,6 +699,7 @@ class BackendManager:
             revision = source.revision or "main"
             try:
                 from typing import Any, cast
+
                 cached = cast(Any, self._hf).cache_files()
                 for cf in cached:
                     if cf.repo_id == source.repo_id:
@@ -772,7 +717,7 @@ class BackendManager:
                 pass
         return None
 
-    def _map_preset_path_sync(self, source: ModelSource, resolved_path: Path) -> str:
+    def _map_model_path_sync(self, source: ModelSource, resolved_path: Path) -> str:
         local_p = resolved_path.resolve().absolute()
         cache_dir = self._hf.cache_dir.resolve().absolute()
         if local_p.is_relative_to(cache_dir):
@@ -786,55 +731,53 @@ class BackendManager:
 
     async def _generate_presets_ini(
         self,
-        family_name: str,
-        active_preset_name: str | None = None,
-        active_preset_resolved_path: Path | None = None,
-        active_preset_draft_resolved_path: Path | None = None,
+        runtime_type: str,
+        active_model_name: str | None = None,
+        active_model_resolved_path: Path | None = None,
+        active_model_draft_resolved_path: Path | None = None,
     ) -> str:
         lines = []
-        lines.append("[*]")
-        lines.append("ngl = 99")
-        lines.append("")
 
         for m in self._config.models:
-            if m.backend_family == family_name:
+            if runtime_type in m.runtimes:
+                rt_cfg = m.runtimes[runtime_type]
                 resolved_model_path = None
                 resolved_draft_path = None
 
-                if m.name == active_preset_name:
-                    resolved_model_path = active_preset_resolved_path
-                    resolved_draft_path = active_preset_draft_resolved_path
+                if m.name == active_model_name:
+                    resolved_model_path = active_model_resolved_path
+                    resolved_draft_path = active_model_draft_resolved_path
                 else:
-                    resolved_model_path = self._find_cached_path(m.model)
-                    if m.speculative.draft_model is not None:
+                    resolved_model_path = self._find_cached_path(rt_cfg.source)
+                    if rt_cfg.speculative.draft_model is not None:
                         resolved_draft_path = self._find_cached_path(
-                            m.speculative.draft_model
+                            rt_cfg.speculative.draft_model
                         )
 
                 if resolved_model_path is None:
                     continue
 
                 lines.append(f"[{m.name}]")
-                container_path = self._map_preset_path_sync(
-                    m.model, resolved_model_path
+                container_path = self._map_model_path_sync(
+                    rt_cfg.source, resolved_model_path
                 )
                 lines.append(f"model = {container_path}")
 
-                if m.speculative.type != "none":
-                    lines.append(f"spec-type = {m.speculative.type}")
+                if rt_cfg.speculative.type != "none":
+                    lines.append(f"spec-type = {rt_cfg.speculative.type}")
                     if (
-                        m.speculative.draft_model is not None
+                        rt_cfg.speculative.draft_model is not None
                         and resolved_draft_path is not None
                     ):
-                        draft_p = self._map_preset_path_sync(
-                            m.speculative.draft_model, resolved_draft_path
+                        draft_p = self._map_model_path_sync(
+                            rt_cfg.speculative.draft_model, resolved_draft_path
                         )
                         lines.append(f"model-draft = {draft_p}")
 
                 # Extra args mapping
                 i = 0
-                while i < len(m.extra_args):
-                    arg = m.extra_args[i]
+                while i < len(rt_cfg.extra_args):
+                    arg = rt_cfg.extra_args[i]
                     if arg.startswith("-") and len(arg) > 1:
                         if "=" in arg:
                             parts = arg.split("=", 1)
@@ -849,10 +792,10 @@ class BackendManager:
                             i += 1
                         else:
                             key = arg[2:] if arg.startswith("--") else arg[1:]
-                            if i + 1 < len(m.extra_args) and not m.extra_args[
+                            if i + 1 < len(rt_cfg.extra_args) and not rt_cfg.extra_args[
                                 i + 1
                             ].startswith("-"):
-                                val = m.extra_args[i + 1]
+                                val = rt_cfg.extra_args[i + 1]
                                 lines.append(f"{key} = {val}")
                                 i += 2
                             else:
@@ -872,7 +815,7 @@ class BackendManager:
         request: httpx.Request,
     ) -> ProxySessionProtocol:
         if self._active_runtime is None:
-            msg = "no backend is loaded"
+            msg = "no model is loaded"
             raise RuntimeError(msg)
         client = self._proxy_client_factory(self._active_runtime.base_url)
         try:
@@ -884,24 +827,25 @@ class BackendManager:
                 params=request.url.params,
             )
             response = await client.send(upstream, stream=True)
-        except Exception:  # noqa: BLE001
+        except Exception:
             await client.aclose()
             raise
         return ProxySession(client=client, response=response)
 
-    def active_backend(self) -> ActiveBackendProtocol | None:
-        if self._active_model_name is None:
+    def active_model(self) -> ActiveModelProtocol | None:
+        if self._active_model_name is None or self._active_runtime is None:
             return None
-        # Return a namespace containing the active ModelPresetConfig for compatibility
-        preset = self._get_preset(self._active_model_name)
-        return SimpleNamespace(config=preset)
+        model_cfg = self._get_model_config(self._active_model_name)
+        return ActiveModel(
+            self._active_model_name, model_cfg, self._active_runtime.runtime_type
+        )
 
     async def get_logs(self, name: str) -> list[str]:
         if self._active_model_name == name and self._active_runtime is not None:
             return await self._active_runtime.get_logs()
         return []
 
-    def find_backend_for_model(self, model_name: str) -> str | None:
+    def find_model_for_name(self, model_name: str) -> str | None:
         for m in self._config.models:
             if m.name == model_name:
                 return m.name
@@ -909,21 +853,22 @@ class BackendManager:
 
     async def cleanup(self) -> None:
         async with self._lock:
-            # 1. Stop current runtime
+            stop_exc = None
             if self._active_runtime is not None:
                 try:
                     await self._active_runtime.stop()
+                    self._active_runtime = None
+                    self._active_model_name = None
                 except Exception as exc:
                     logger.error(
                         "Failed to stop active runtime during cleanup: %s", exc
                     )
-                finally:
-                    self._active_runtime = None
-                    self._active_model_name = None
-                    self._active_family = None
+                    stop_exc = exc
 
-            # 2. Aggressively clean up all containers matching our label
             await self._cleanup_all_managed_containers()
+
+            if stop_exc is not None:
+                raise stop_exc
 
     async def _cleanup_all_managed_containers(self) -> None:
         try:
@@ -943,6 +888,27 @@ class BackendManager:
                 all=True,
             )
             for container in containers:
+                if self._active_runtime is not None:
+                    active_container = self._active_runtime.container
+                    if active_container is not None and (
+                        container.id == active_container.id
+                        or container.name == active_container.name
+                    ):
+                        logger.info(
+                            "Skipping active container %s from general cleanup",
+                            container.name,
+                        )
+                        continue
+                    active_name = (
+                        f"inference-server-runtime-{self._active_runtime.runtime_type}"
+                    )
+                    if container.name == active_name:
+                        logger.info(
+                            "Skipping active container by name %s from general cleanup",
+                            container.name,
+                        )
+                        continue
+
                 try:
                     logger.info("Cleaning up container: %s", container.name)
                     try:
@@ -962,6 +928,3 @@ class BackendManager:
                     )
         except Exception as exc:
             logger.error("Failed to list containers for cleanup: %s", exc)
-
-
-from types import SimpleNamespace  # noqa: E402
