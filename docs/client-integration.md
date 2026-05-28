@@ -10,8 +10,8 @@ client = OpenAI(
     api_key="not-needed",
 )
 
-# Load the preset first:
-# POST http://localhost:8000/api/models/gemma/load
+# Load the model first (specifying rocm/vulkan runtime in the JSON body):
+# POST http://localhost:8000/api/models/gemma/load {"runtime": "rocm"}
 response = client.chat.completions.create(
     model="gemma",
     messages=[{"role": "user", "content": "Explain gravity in one sentence."}],

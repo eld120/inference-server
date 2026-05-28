@@ -11,7 +11,7 @@ Create a `.env` file in the project root if you want to override runtime default
 | `INF_CONFIG_PATH` | Path to `config.json`. Default: `~/.config/inference-server/config.json` |
 | `INF_HOST` | Gateway bind address. Default: `0.0.0.0` |
 | `INF_PORT` | Gateway bind port. Default: `8000` |
-| `INF_BACKEND_PORT` | Host port mapped to the active model container. Default: `39281` |
+| `INF_RUNTIME_PORT` | Host port mapped to the active runtime container. Default: `39281` (deprecated alias: `INF_BACKEND_PORT`) |
 | `INF_HF_TOKEN` | Hugging Face token for gated or private models. Also reads `HF_TOKEN` and `HUGGINGFACE_HUB_TOKEN`. |
 
 ## Config File
@@ -22,55 +22,65 @@ Top-level fields:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `runtime_mode` | `"auto"` \| `"router"` \| `"container"` | `"auto"` | Selects the runtime strategy. |
 | `api_prefix` | `string` | `"/api"` | Prefix for all server routes. |
 | `hf_cache_dir` | `string` | `~/.cache/huggingface/hub` | Local Hugging Face cache directory. |
 | `hf_token` | `string \| null` | `null` | Used when no env token is present. |
-| `backend_families` | `object` | `{}` | Backend family definitions. |
-| `models` | `array` | `[]` | Preset definitions. |
+| `models` | `array` | `[]` | Configured models. |
 
-## Backend Families
+---
 
-Each backend family defines the runtime image and shared container settings.
+## Configured Models
 
-| Field | Type | Notes |
-|---|---|---|
-| `docker_image` | `string` | Container image used for this family. |
-| `devices` | `string[]` | Device nodes passed through to the container. |
-| `volumes` | `object` | Additional host-to-container mounts. |
-| `shared_args` | `string[]` | CLI arguments applied to every model in the family. |
-| `router_supported` | `boolean` | Whether router mode can be used. |
-
-## Model Presets
-
-Each preset must have a unique `name` and reference a known backend family.
+Each model must have a unique `name` and configuration for one or more hardware runtimes.
 
 | Field | Type | Notes |
 |---|---|---|
-| `name` | `string` | Canonical preset key used by clients. |
-| `backend_family` | `string` | References `backend_families`. |
-| `bind_host` | `string` | Container bind host. Default: `127.0.0.1`. |
-| `connect_host` | `string` | Host used by the proxy to reach the model runtime. Default: `127.0.0.1`. |
-| `model` | `object` | Requires either `local_path` or `repo_id` + `filename`. |
-| `speculative` | `object` | Optional speculative decoding config. |
-| `extra_args` | `string[]` | Preset-specific CLI flags. |
+| `name` | `string` | Canonical model name/key used by clients (e.g. `gemma`, `qwen`). |
+| `runtimes` | `object` | Dictionary of runtime configurations keyed by `"rocm"` and/or `"vulkan"`. |
+
+---
+
+## Runtime Configurations
+
+Each runtime block specifies the model source and execution details for that specific runtime environment.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `source` | `object` | Required | Model source info (see below). |
+| `docker_image` | `string` | Required | Container image to run (e.g. `ghcr.io/ggerganov/llama.cpp:server-rocm`). |
+| `devices` | `string[]` | `[]` | Device nodes passed through to the container. |
+| `volumes` | `object` | `{}` | Host-to-container mount paths. |
+| `shared_args` | `string[]` | `[]` | Global llama.cpp options. |
+| `extra_args` | `string[]` | `[]` | Model-specific llama.cpp arguments. |
+| `speculative` | `object` | `{}` | Optional speculative decoding configuration. |
+| `bind_host` | `string` | `"127.0.0.1"` | Bind host for the runtime. |
+| `connect_host` | `string` | `"127.0.0.1"` | Target host the gateway uses to forward proxy requests. |
 
 ### Model Source
 
-Use one of these forms:
+Specify either a local filepath or Hugging Face Hub attributes:
 
-- `local_path`
-- `repo_id` + `filename`
+- `local_path` (string): Absolute or relative path to a local GGUF model file.
+- `repo_id` (string): The Hugging Face repo name (e.g., `ggml-org/gemma-3-1b-it-GGUF`).
+- `filename` (string): The GGUF filename inside the repo (e.g., `gemma-3-1b-it-Q4_K_M.gguf`).
+- `revision` (string): The repo branch or revision (defaults to `"main"`).
 
-`revision` defaults to `main`.
+> [!NOTE]
+> If using `repo_id`, both `repo_id` and `filename` must be supplied.
 
 ### Speculative Decoding
 
-Supported speculative types include:
+Configured via the `speculative` field under a runtime:
 
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `type` | `string` | `"none"` | One of the speculative types listed below. |
+| `draft_model` | `object \| null` | `null` | Optional draft Model Source (same structure as `source`). |
+
+Supported speculative types:
 - `none`
-- `draft`
-- `draft-simple`
+- `draft` (Requires `draft_model`)
+- `draft-simple` (Requires `draft_model`)
 - `draft-mtp`
 - `ngram-cache`
 - `ngram-simple`
@@ -78,12 +88,8 @@ Supported speculative types include:
 - `ngram-map-k4v`
 - `ngram-mod`
 
-Rules:
-
-- `draft` and `draft-simple` require a `draft_model`.
-- Other types reject `draft_model`.
-- `draft-mtp` is self-contained and does not need a separate draft model.
+---
 
 ## Example
 
-Use [config.example.json](../config.example.json) as the starting point for a real config file.
+Refer to [config.example.json](../config.example.json) as the base template for configuring model-first runtime environments.
