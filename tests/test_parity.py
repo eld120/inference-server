@@ -1,24 +1,24 @@
-"""Tests for router/container parity.
+"""Tests for concrete LlamaRuntime settings.
 
-Verifies that the same preset key produces equivalent effective runtime
-semantics regardless of whether router or container strategy is used.
-This includes GPU offload, speculative settings, extra_args, and ports.
+Verifies that the runtime configuration produces correct docker container settings,
+ports, devices, shared arguments, and that the INI file maps speculative/extra
+settings correctly.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import pytest
 
 from config import RuntimeSettings
-from manager import BackendManager
+from manager import ModelRuntimeManager
 from schemas import (
     AppConfig,
-    BackendFamilyConfig,
-    ModelPresetConfig,
+    ModelConfig,
     ModelSource,
+    RuntimeConfig,
     SpeculativeConfig,
 )
 from tests.test_manager import (
@@ -33,10 +33,9 @@ async def _capture_container_run_kwargs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     app_config: AppConfig,
-    preset_name: str,
+    model_name: str,
 ) -> dict[str, Any]:
-    """Helper that loads a preset and captures the kwargs passed to
-    docker containers.run()."""
+    """Helper that loads a model and captures the kwargs passed to docker run."""
     mock_client = MockDockerClient()
     monkeypatch.setattr("docker.from_env", lambda: mock_client)
 
@@ -44,7 +43,7 @@ async def _capture_container_run_kwargs(
         return "mock_commit_123"
 
     monkeypatch.setattr(
-        "manager.BackendManager._resolve_commit_hash", fake_resolve_commit_hash
+        "manager.ModelRuntimeManager._resolve_commit_hash", fake_resolve_commit_hash
     )
 
     captured_kwargs: dict[str, Any] = {}
@@ -57,7 +56,7 @@ async def _capture_container_run_kwargs(
     monkeypatch.setattr(mock_client.containers, "run", run_spy)
 
     upstream_app = MockUpstreamApp()
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=RuntimeSettings(config_path=tmp_path / "config.json"),
         app_config=app_config,
         hf=FakeHF(tmp_path),
@@ -71,176 +70,109 @@ async def _capture_container_run_kwargs(
 
     monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
 
-    await manager.load(preset_name)
+    await manager.load(model_name, "rocm")
     return captured_kwargs
 
 
 def _make_config(
-    mode: Literal["auto", "router", "container"],
     *,
     speculative: SpeculativeConfig | None = None,
     extra_args: list[str] | None = None,
     shared_args: list[str] | None = None,
     tmp_path: Path,
 ) -> AppConfig:
-    """Create a test AppConfig with given mode and optional speculative config."""
+    """Create a test AppConfig with optional speculative config."""
     spec = speculative or SpeculativeConfig()
     return AppConfig(
-        runtime_mode=mode,
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                devices=["/dev/kfd", "/dev/dri"],
-                shared_args=shared_args or [],
-            )
-        },
         models=[
-            ModelPresetConfig(
+            ModelConfig(
                 name="test_model",
-                backend_family="rocm",
-                model=ModelSource(local_path=tmp_path / "model.gguf"),
-                speculative=spec,
-                extra_args=extra_args or [],
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        shared_args=shared_args or [],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                        speculative=spec,
+                        extra_args=extra_args or [],
+                    )
+                },
             )
         ],
     )
 
 
 # ---------------------------------------------------------------------------
-# Parity tests
+# Tests
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_both_strategies_use_same_devices(
+async def test_runtime_uses_devices(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Both strategies should mount the same GPU devices."""
-    container_config = _make_config("container", tmp_path=tmp_path)
-    router_config = _make_config("router", tmp_path=tmp_path)
-
-    container_kwargs = await _capture_container_run_kwargs(
-        monkeypatch, tmp_path, container_config, "test_model"
-    )
-    router_kwargs = await _capture_container_run_kwargs(
-        monkeypatch, tmp_path, router_config, "test_model"
-    )
-
-    assert container_kwargs["devices"] == router_kwargs["devices"]
-    assert container_kwargs["devices"] == ["/dev/kfd:/dev/kfd", "/dev/dri:/dev/dri"]
-
-
-@pytest.mark.asyncio
-async def test_both_strategies_use_same_port(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Both strategies should bind to the same host port."""
-    container_config = _make_config("container", tmp_path=tmp_path)
-    router_config = _make_config("router", tmp_path=tmp_path)
-
-    container_kwargs = await _capture_container_run_kwargs(
-        monkeypatch, tmp_path, container_config, "test_model"
-    )
-    router_kwargs = await _capture_container_run_kwargs(
-        monkeypatch, tmp_path, router_config, "test_model"
-    )
-
-    assert container_kwargs["ports"] == router_kwargs["ports"]
-
-
-@pytest.mark.asyncio
-async def test_both_strategies_use_same_image(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Both strategies should use the same Docker image from the family."""
-    container_config = _make_config("container", tmp_path=tmp_path)
-    router_config = _make_config("router", tmp_path=tmp_path)
-
-    container_kwargs = await _capture_container_run_kwargs(
-        monkeypatch, tmp_path, container_config, "test_model"
-    )
-    router_kwargs = await _capture_container_run_kwargs(
-        monkeypatch, tmp_path, router_config, "test_model"
-    )
-
-    assert container_kwargs["image"] == router_kwargs["image"]
-    assert container_kwargs["image"] == "ghcr.io/ggerganov/llama.cpp:server-rocm"
-
-
-@pytest.mark.asyncio
-async def test_both_strategies_include_shared_args(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Both strategies should include shared_args from the backend family."""
-    shared = ["-ngl", "99"]
-    container_config = _make_config(
-        "container", shared_args=shared, tmp_path=tmp_path
-    )
-    router_config = _make_config(
-        "router", shared_args=shared, tmp_path=tmp_path
-    )
-
-    container_kwargs = await _capture_container_run_kwargs(
-        monkeypatch, tmp_path, container_config, "test_model"
-    )
-    router_kwargs = await _capture_container_run_kwargs(
-        monkeypatch, tmp_path, router_config, "test_model"
-    )
-
-    # Container mode appends shared_args to the command
-    container_cmd = container_kwargs["command"]
-    assert "-ngl" in container_cmd
-    assert "99" in container_cmd
-
-    # Router mode also appends shared_args to the command
-    router_cmd = router_kwargs["command"]
-    assert "-ngl" in router_cmd
-    assert "99" in router_cmd
-
-
-@pytest.mark.asyncio
-async def test_speculative_settings_in_container_command(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Container strategy should include speculative type in command."""
-    spec = SpeculativeConfig(type="draft-mtp")
-    config = _make_config("container", speculative=spec, tmp_path=tmp_path)
-
+    """The runtime should mount the specified GPU devices."""
+    config = _make_config(tmp_path=tmp_path)
     kwargs = await _capture_container_run_kwargs(
         monkeypatch, tmp_path, config, "test_model"
     )
-
-    cmd = kwargs["command"]
-    assert "--spec-type" in cmd
-    spec_idx = cmd.index("--spec-type")
-    assert cmd[spec_idx + 1] == "draft-mtp"
+    assert kwargs["devices"] == ["/dev/kfd:/dev/kfd", "/dev/dri:/dev/dri"]
 
 
 @pytest.mark.asyncio
-async def test_speculative_settings_in_router_ini(
+async def test_runtime_uses_port(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Router strategy should include speculative type in generated INI."""
-    mock_client = MockDockerClient()
-    monkeypatch.setattr("docker.from_env", lambda: mock_client)
-
-    async def fake_resolve_commit_hash(*args: Any, **kwargs: Any) -> str:
-        return "mock_commit_123"
-
-    monkeypatch.setattr(
-        "manager.BackendManager._resolve_commit_hash", fake_resolve_commit_hash
+    """The runtime should bind to the expected port."""
+    config = _make_config(tmp_path=tmp_path)
+    kwargs = await _capture_container_run_kwargs(
+        monkeypatch, tmp_path, config, "test_model"
     )
+    assert kwargs["ports"] == {"8080/tcp": ("127.0.0.1", 39281)}
 
+
+@pytest.mark.asyncio
+async def test_runtime_uses_image(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The runtime should use the specified Docker image."""
+    config = _make_config(tmp_path=tmp_path)
+    kwargs = await _capture_container_run_kwargs(
+        monkeypatch, tmp_path, config, "test_model"
+    )
+    assert kwargs["image"] == "ghcr.io/ggerganov/llama.cpp:server-rocm"
+
+
+@pytest.mark.asyncio
+async def test_runtime_includes_shared_args(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The runtime should include shared_args in its container command."""
+    shared = ["--threads", "4"]
+    config = _make_config(shared_args=shared, tmp_path=tmp_path)
+    kwargs = await _capture_container_run_kwargs(
+        monkeypatch, tmp_path, config, "test_model"
+    )
+    cmd = kwargs["command"]
+    assert "--threads" in cmd
+    assert "4" in cmd
+    assert "--models-preset" in cmd
+
+
+@pytest.mark.asyncio
+async def test_speculative_settings_in_ini(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The runtime should include speculative type in the generated presets INI file."""
     spec = SpeculativeConfig(type="draft-mtp")
-    config = _make_config("router", speculative=spec, tmp_path=tmp_path)
+    config = _make_config(speculative=spec, tmp_path=tmp_path)
 
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=RuntimeSettings(config_path=tmp_path / "config.json"),
         app_config=config,
         hf=FakeHF(tmp_path),
@@ -251,47 +183,14 @@ async def test_speculative_settings_in_router_ini(
 
 
 @pytest.mark.asyncio
-async def test_extra_args_in_container_command(
+async def test_extra_args_in_ini(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Container strategy should include extra_args in the command."""
-    config = _make_config(
-        "container", extra_args=["-c", "4096", "--temp", "0.7"], tmp_path=tmp_path
-    )
+    """The runtime should translate extra_args to INI key-value pairs."""
+    config = _make_config(extra_args=["-c", "4096", "--temp", "0.7"], tmp_path=tmp_path)
 
-    kwargs = await _capture_container_run_kwargs(
-        monkeypatch, tmp_path, config, "test_model"
-    )
-
-    cmd = kwargs["command"]
-    assert "-c" in cmd
-    assert "4096" in cmd
-    assert "--temp" in cmd
-    assert "0.7" in cmd
-
-
-@pytest.mark.asyncio
-async def test_extra_args_in_router_ini(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Router strategy should translate extra_args to INI key-value pairs."""
-    mock_client = MockDockerClient()
-    monkeypatch.setattr("docker.from_env", lambda: mock_client)
-
-    async def fake_resolve_commit_hash(*args: Any, **kwargs: Any) -> str:
-        return "mock_commit_123"
-
-    monkeypatch.setattr(
-        "manager.BackendManager._resolve_commit_hash", fake_resolve_commit_hash
-    )
-
-    config = _make_config(
-        "router", extra_args=["-c", "4096", "--temp", "0.7"], tmp_path=tmp_path
-    )
-
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=RuntimeSettings(config_path=tmp_path / "config.json"),
         app_config=config,
         hf=FakeHF(tmp_path),
@@ -303,50 +202,37 @@ async def test_extra_args_in_router_ini(
 
 
 @pytest.mark.asyncio
-async def test_both_strategies_label_containers(
+async def test_runtime_labels_containers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Both strategies should label containers for singleton cleanup."""
-    container_config = _make_config("container", tmp_path=tmp_path)
-    router_config = _make_config("router", tmp_path=tmp_path)
-
-    container_kwargs = await _capture_container_run_kwargs(
-        monkeypatch, tmp_path, container_config, "test_model"
+    """The runtime should label containers for singleton cleanup."""
+    config = _make_config(tmp_path=tmp_path)
+    kwargs = await _capture_container_run_kwargs(
+        monkeypatch, tmp_path, config, "test_model"
     )
-    router_kwargs = await _capture_container_run_kwargs(
-        monkeypatch, tmp_path, router_config, "test_model"
-    )
-
-    assert container_kwargs["labels"] == {"managed-by": "inference-server"}
-    assert router_kwargs["labels"] == {"managed-by": "inference-server"}
+    assert kwargs["labels"] == {"managed-by": "inference-server"}
 
 
 @pytest.mark.asyncio
-async def test_gpu_offload_defaults_parity(
+async def test_gpu_offload_defaults(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Both strategies should default to GPU offload (ngl=99) when not specified."""
-    container_config = _make_config("container", tmp_path=tmp_path)
-    router_config = _make_config("router", tmp_path=tmp_path)
+    """Presets INI file should not contain ngl = 99 globally by default."""
+    config = _make_config(tmp_path=tmp_path)
 
-    container_kwargs = await _capture_container_run_kwargs(
-        monkeypatch, tmp_path, container_config, "test_model"
-    )
-    container_cmd = container_kwargs["command"]
-    assert "-ngl" in container_cmd
-    assert "99" in container_cmd
-
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=RuntimeSettings(config_path=tmp_path / "config.json"),
-        app_config=router_config,
+        app_config=config,
         hf=FakeHF(tmp_path),
     )
+
     async def fake_resolve_commit_hash(*args: Any, **kwargs: Any) -> str:
         return "mock_commit_123"
+
     monkeypatch.setattr(
-        "manager.BackendManager._resolve_commit_hash", fake_resolve_commit_hash
+        "manager.ModelRuntimeManager._resolve_commit_hash", fake_resolve_commit_hash
     )
     ini_content = await manager._generate_presets_ini("rocm")
-    assert "ngl = 99" in ini_content
+    assert "ngl = 99" not in ini_content

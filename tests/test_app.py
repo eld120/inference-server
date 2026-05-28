@@ -9,55 +9,72 @@ from httpx import Request as HTTPXRequest
 
 from app import create_app
 from manager import ProxySession
-from protocols import ActiveBackendProtocol
+from protocols import ActiveModelProtocol
 from schemas import (
     AppConfig,
-    BackendStatus,
-    ModelPresetConfig,
+    ModelConfig,
+    ModelResource,
     ModelSource,
+    ModelStatus,
+    RuntimeConfig,
     ServiceStatus,
+    SpeculativeConfig,
 )
 
 
 class FakeManager:
-    def __init__(self, backend: BackendStatus) -> None:
-        self._backend = backend
+    def __init__(self, model_resource: ModelResource) -> None:
+        self._model_resource = model_resource
 
     def status(self) -> ServiceStatus:
         return ServiceStatus(
             healthy=True,
             api_prefix="/api",
-            active_backend=self._backend.name,
-            backends=[self._backend],
+            config_path="config.json",
+            active_model=self._model_resource.name,
+            active_runtime="rocm",
+            models=[self._model_resource],
         )
 
-    def backend_statuses(self) -> list[BackendStatus]:
-        return [self._backend]
+    def model_statuses(self) -> list[ModelStatus]:
+        return [self._model_resource.status]
 
-    async def load(self, name: str) -> BackendStatus:
-        assert name == self._backend.name
-        return self._backend
+    def model_resources(self) -> list[ModelResource]:
+        return [self._model_resource]
 
-    async def unload(self, name: str | None = None) -> BackendStatus:
-        assert name in {None, self._backend.name}
-        return self._backend
+    def model_resource(self, name: str) -> ModelResource:
+        assert name == self._model_resource.name
+        return self._model_resource
 
-    def active_backend(self) -> ActiveBackendProtocol | None:
+    async def load(self, name: str, runtime: str) -> ModelResource:
+        assert name == self._model_resource.name
+        assert runtime == "rocm"
+        return self._model_resource
+
+    async def unload(self, name: str | None = None) -> ModelResource:
+        assert name in {None, self._model_resource.name}
+        return self._model_resource
+
+    def active_model(self) -> ActiveModelProtocol | None:
         return SimpleNamespace(
-            config=SimpleNamespace(name=self._backend.name),
+            config=SimpleNamespace(name=self._model_resource.name),
         )
 
-    def find_backend_for_model(self, model_name: str) -> str | None:
-        if model_name == self._backend.name:
-            return self._backend.name
+    def find_model_for_name(self, model_name: str) -> str | None:
+        if model_name == self._model_resource.name:
+            return self._model_resource.name
         return None
 
-    def backends(self) -> list[ModelPresetConfig]:
+    def models(self) -> list[ModelConfig]:
         return [
-            ModelPresetConfig(
-                name=self._backend.name,
-                model=ModelSource(local_path=Path("/models/dummy.gguf")),
-                backend_family="rocm",
+            ModelConfig(
+                name=self._model_resource.name,
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        source=ModelSource(local_path=Path("/models/dummy.gguf")),
+                    )
+                },
             )
         ]
 
@@ -72,9 +89,9 @@ class FakeManager:
         path: str,
         request: HTTPXRequest,
     ) -> ProxySession:
-        backend = FastAPI()
+        mock_app = FastAPI()
 
-        @backend.post("/v1/chat/completions")
+        @mock_app.post("/v1/chat/completions")
         async def chat_completions(request: FastAPIRequest) -> dict[str, object]:
             return {
                 "ok": "yes",
@@ -83,8 +100,8 @@ class FakeManager:
             }
 
         client = AsyncClient(
-            transport=ASGITransport(app=backend),
-            base_url="http://backend",
+            transport=ASGITransport(app=mock_app),
+            base_url="http://mock_upstream",
         )
         upstream_request = client.build_request(
             "POST",
@@ -98,32 +115,54 @@ class FakeManager:
 
 @pytest.mark.asyncio
 async def test_app_routes_and_proxy(tmp_path: Path) -> None:
-    backend = BackendStatus(
+    model_resource = ModelResource(
         name="primary",
-        state="running",
-        model="repo/model.gguf",
-        speculative_type="draft-mtp",
-        host="127.0.0.1",
-        port=8080,
-        base_url="http://127.0.0.1:8080",
-        active=True,
+        config=ModelConfig(
+            name="primary",
+            runtimes={
+                "rocm": RuntimeConfig(
+                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                    source=ModelSource(local_path=Path("/models/dummy.gguf")),
+                    speculative=SpeculativeConfig(type="draft-mtp"),
+                )
+            },
+        ),
+        status=ModelStatus(
+            name="primary",
+            state="running",
+            model="repo/model.gguf",
+            speculative_type="draft-mtp",
+            host="127.0.0.1",
+            port=8080,
+            base_url="http://127.0.0.1:8080",
+            active=True,
+            active_runtime="rocm",
+        ),
     )
     app = create_app(
         app_config=AppConfig(models=[], api_prefix="/api", hf_cache_dir=tmp_path),
-        manager=FakeManager(backend),
+        manager=FakeManager(model_resource),
     )
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
-        health = await client.get("/api/healthz")
+        health = await client.get("/api/health")
         status = await client.get("/api/status")
+        models = await client.get("/api/models")
+        model = await client.get("/api/models/primary")
+        loaded = await client.post("/api/models/primary/load", json={"runtime": "rocm"})
+        unloaded = await client.post("/api/models/primary/unload")
         proxied = await client.post(
             "/api/v1/chat/completions?foo=bar",
             json={"model": "primary"},
         )
 
     assert health.json() == {"ok": True}
-    assert status.json()["active_backend"] == "primary"
+    assert status.json()["active_model"] == "primary"
+    assert models.json()["models"][0]["name"] == "primary"
+    assert model.json()["name"] == "primary"
+    assert loaded.json()["name"] == "primary"
+    assert unloaded.json()["name"] == "primary"
     assert proxied.json() == {
         "ok": "yes",
         "path": "/v1/chat/completions",

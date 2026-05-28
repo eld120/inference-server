@@ -13,12 +13,12 @@ from httpx import ASGITransport, AsyncClient
 
 from app import create_app
 from config import RuntimeSettings
-from manager import BackendManager, ContainerRuntime, ProxySession
+from manager import ModelRuntimeManager, RuntimeContainer, ProxySession
 from schemas import (
     AppConfig,
-    BackendFamilyConfig,
-    ModelPresetConfig,
+    ModelConfig,
     ModelSource,
+    RuntimeConfig,
 )
 
 
@@ -102,40 +102,33 @@ class MockContainers:
         return containers
 
 
-class MockDockerClient:
-    def __init__(self) -> None:
-        self.containers = MockContainers()
-        self.images = MockImages()
-
-
 @pytest.mark.asyncio
-async def test_find_backend_for_model(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_find_model_for_name(monkeypatch: pytest.MonkeyPatch) -> None:
     mock_client = MockDockerClient()
     monkeypatch.setattr("docker.from_env", lambda: mock_client)
 
     app_config = AppConfig(
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm"
-            )
-        },
         models=[
-            ModelPresetConfig(
+            ModelConfig(
                 name="gemma",
-                backend_family="rocm",
-                model=ModelSource(
-                    repo_id="ggml-org/gemma-3-1b-it-GGUF",
-                    filename="gemma-3-1b-it-Q4_K_M.gguf",
-                ),
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        source=ModelSource(
+                            repo_id="ggml-org/gemma-3-1b-it-GGUF",
+                            filename="gemma-3-1b-it-Q4_K_M.gguf",
+                        ),
+                    )
+                },
             )
         ],
     )
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=RuntimeSettings(), app_config=app_config, hf=FakeHF()
     )
 
-    assert manager.find_backend_for_model("gemma") == "gemma"
-    assert manager.find_backend_for_model("nonexistent") is None
+    assert manager.find_model_for_name("gemma") == "gemma"
+    assert manager.find_model_for_name("nonexistent") is None
 
 
 @pytest.mark.asyncio
@@ -144,25 +137,24 @@ async def test_logs_capturing_and_get_logs(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr("docker.from_env", lambda: mock_client)
 
     app_config = AppConfig(
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm"
-            )
-        },
         models=[
-            ModelPresetConfig(
+            ModelConfig(
                 name="gemma",
-                backend_family="rocm",
-                model=ModelSource(local_path=Path("mock.gguf")),
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        source=ModelSource(local_path=Path("mock.gguf")),
+                    )
+                },
             )
         ],
     )
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=RuntimeSettings(), app_config=app_config, hf=FakeHF()
     )
 
-    preset = manager._get_preset("gemma")
-    runtime = ContainerRuntime(preset, app_config.backend_families["rocm"], manager)
+    model_config = manager._get_model_config("gemma")
+    runtime = RuntimeContainer("rocm", "gemma", model_config.runtimes["rocm"], manager)
 
     class CustomMockContainer:
         id = "mock-id"
@@ -184,26 +176,31 @@ async def test_vram_safe_swap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("docker.from_env", lambda: mock_client)
 
     app_config = AppConfig(
-        runtime_mode="container",
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm"
-            )
-        },
         models=[
-            ModelPresetConfig(
-                name="backend1",
-                backend_family="rocm",
-                model=ModelSource(local_path=Path("b1.gguf")),
+            ModelConfig(
+                name="model1",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        source=ModelSource(local_path=Path("b1.gguf")),
+                        connect_host="127.0.0.1",
+                    )
+                },
             ),
-            ModelPresetConfig(
-                name="backend2",
-                backend_family="rocm",
-                model=ModelSource(local_path=Path("b2.gguf")),
+            ModelConfig(
+                name="model2",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        source=ModelSource(local_path=Path("b2.gguf")),
+                        # make them incompatible to trigger container restart
+                        connect_host="127.0.0.2",
+                    )
+                },
             ),
         ],
     )
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=RuntimeSettings(),
         app_config=app_config,
         hf=FakeHF(),
@@ -225,16 +222,21 @@ async def test_vram_safe_swap(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(manager, "_remove_conflicting_container", fake_remove)
     monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
-    monkeypatch.setattr(ContainerRuntime, "_wait_until_ready", fake_wait_until_ready)
+    monkeypatch.setattr(RuntimeContainer, "_wait_until_ready", fake_wait_until_ready)
 
-    # Load first backend
-    await manager.load("backend1")
-    assert manager._active_model_name == "backend1"
-    b1_container = mock_client.containers.get("inference-server-backend1")
+    # Mock load_model on RuntimeContainer so it doesn't try to call the real endpoint
+    async def mock_load_model(self, name: str) -> None:
+        pass
+
+    monkeypatch.setattr(RuntimeContainer, "load_model", mock_load_model)
+
+    # Load first model
+    await manager.load("model1", "rocm")
+    assert manager._active_model_name == "model1"
+    b1_container = mock_client.containers.get("inference-server-runtime-rocm")
     assert b1_container.stopped is False
 
-    # Load second backend (with vram_safe_swap=True,
-    # b1 is terminated *before* b2 starts)
+    # Load second model (m1 container must be terminated *before* m2 starts)
     original_run = mock_client.containers.run
 
     def assert_terminated_run(**kwargs: Any) -> MockContainer:
@@ -242,12 +244,12 @@ async def test_vram_safe_swap(monkeypatch: pytest.MonkeyPatch) -> None:
         return original_run(**kwargs)
 
     monkeypatch.setattr(mock_client.containers, "run", assert_terminated_run)
-    await manager.load("backend2")
-    assert manager._active_model_name == "backend2"
+    await manager.load("model2", "rocm")
+    assert manager._active_model_name == "model2"
 
 
 class FakeAppManager:
-    def __init__(self, primary: ModelPresetConfig) -> None:
+    def __init__(self, primary: ModelConfig) -> None:
         self._primary = primary
         self.loaded: list[str] = []
         self._active: str | None = None
@@ -256,24 +258,27 @@ class FakeAppManager:
         return SimpleNamespace(
             healthy=True,
             api_prefix="/api",
-            active_backend=self._active,
-            backends=[],
+            active_model=self._active,
+            models=[],
         )
 
-    def active_backend(self) -> SimpleNamespace | None:
+    def active_model(self) -> SimpleNamespace | None:
         if self._active is None:
             return None
         return SimpleNamespace(config=self._primary)
 
-    async def load(self, name: str) -> SimpleNamespace:
+    async def load(self, name: str, runtime: str = "rocm") -> SimpleNamespace:
         self.loaded.append(name)
         self._active = name
         return SimpleNamespace(model_dump=lambda: {})
 
-    def find_backend_for_model(self, model_name: str) -> str | None:
+    def find_model_for_name(self, model_name: str) -> str | None:
         if model_name == self._primary.name:
             return self._primary.name
         return None
+
+    def models(self) -> list[ModelConfig]:
+        return [self._primary]
 
     async def get_logs(self, name: str) -> list[str]:
         return ["log line"]
@@ -281,14 +286,14 @@ class FakeAppManager:
     async def open_proxy_session(
         self, path: str, request: httpx.Request
     ) -> ProxySession:
-        backend = FastAPI()
+        upstream_app = FastAPI()
 
-        @backend.post("/v1/chat/completions")
+        @upstream_app.post("/v1/chat/completions")
         async def chat_completions() -> dict[str, str]:
             return {"status": "ok"}
 
         client = AsyncClient(
-            transport=ASGITransport(app=backend), base_url="http://backend"
+            transport=ASGITransport(app=upstream_app), base_url="http://upstream"
         )
         upstream_request = client.build_request("POST", path, content=request.content)
         response = await client.send(upstream_request, stream=True)
@@ -297,17 +302,16 @@ class FakeAppManager:
 
 @pytest.mark.asyncio
 async def test_app_strict_mismatch_and_explicit_load() -> None:
-    primary = ModelPresetConfig(
+    primary = ModelConfig(
         name="gemma",
-        backend_family="rocm",
-        model=ModelSource(local_path=Path("mock.gguf")),
-    )
-    app_config = AppConfig(
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm"
+        runtimes={
+            "rocm": RuntimeConfig(
+                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                source=ModelSource(local_path=Path("mock.gguf")),
             )
         },
+    )
+    app_config = AppConfig(
         models=[primary],
     )
     fake_manager = FakeAppManager(primary)
@@ -328,7 +332,7 @@ async def test_app_strict_mismatch_and_explicit_load() -> None:
         assert "not currently loaded" in response.json()["detail"]
 
         # 2. Explicitly load the model via the load endpoint
-        await fake_manager.load("gemma")
+        await fake_manager.load("gemma", "rocm")
 
         # 3. Now request should succeed with 200
         response = await client.post(
@@ -340,17 +344,16 @@ async def test_app_strict_mismatch_and_explicit_load() -> None:
 
 @pytest.mark.asyncio
 async def test_unknown_model_rejected() -> None:
-    primary = ModelPresetConfig(
+    primary = ModelConfig(
         name="gemma",
-        backend_family="rocm",
-        model=ModelSource(local_path=Path("mock.gguf")),
-    )
-    app_config = AppConfig(
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm"
+        runtimes={
+            "rocm": RuntimeConfig(
+                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                source=ModelSource(local_path=Path("mock.gguf")),
             )
         },
+    )
+    app_config = AppConfig(
         models=[primary],
     )
     fake_manager = FakeAppManager(primary)
@@ -370,7 +373,6 @@ async def test_unknown_model_rejected() -> None:
         assert "not configured" in response.json()["detail"]
 
 
-
 @pytest.mark.asyncio
 async def test_container_spawn_failure_sets_error_state(
     monkeypatch: pytest.MonkeyPatch,
@@ -379,21 +381,19 @@ async def test_container_spawn_failure_sets_error_state(
     monkeypatch.setattr("docker.from_env", lambda: mock_client)
 
     app_config = AppConfig(
-        runtime_mode="container",
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm"
-            )
-        },
         models=[
-            ModelPresetConfig(
+            ModelConfig(
                 name="gemma",
-                backend_family="rocm",
-                model=ModelSource(local_path=Path("mock.gguf")),
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        source=ModelSource(local_path=Path("mock.gguf")),
+                    )
+                },
             )
         ],
     )
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=RuntimeSettings(), app_config=app_config, hf=FakeHF()
     )
 
@@ -416,10 +416,10 @@ async def test_container_spawn_failure_sets_error_state(
     monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
 
     with pytest.raises(RuntimeError, match="failed to create container"):
-        await manager.load("gemma")
+        await manager.load("gemma", "rocm")
 
     status = manager.status()
-    gemma_status = next(b for b in status.backends if b.name == "gemma")
+    gemma_status = next(b for b in status.models if b.name == "gemma")
     assert gemma_status.state == "error"
     assert gemma_status.last_error is not None
     assert "failed to create container" in gemma_status.last_error
@@ -437,21 +437,19 @@ async def test_resolver_failure_sets_error_state(
             raise ValueError("download failed")
 
     app_config = AppConfig(
-        runtime_mode="container",
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm"
-            )
-        },
         models=[
-            ModelPresetConfig(
+            ModelConfig(
                 name="gemma",
-                backend_family="rocm",
-                model=ModelSource(local_path=Path("mock.gguf")),
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        source=ModelSource(local_path=Path("mock.gguf")),
+                    )
+                },
             )
         ],
     )
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=RuntimeSettings(),
         app_config=app_config,
         hf=FailingHFResolver(),
@@ -467,10 +465,10 @@ async def test_resolver_failure_sets_error_state(
     monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
 
     with pytest.raises(ValueError, match="download failed"):
-        await manager.load("gemma")
+        await manager.load("gemma", "rocm")
 
     status = manager.status()
-    gemma_status = next(b for b in status.backends if b.name == "gemma")
+    gemma_status = next(b for b in status.models if b.name == "gemma")
     assert gemma_status.state == "error"
     assert gemma_status.last_error is not None
     assert "download failed" in gemma_status.last_error
@@ -484,21 +482,19 @@ async def test_container_boot_crash_sets_error_state(
     monkeypatch.setattr("docker.from_env", lambda: mock_client)
 
     app_config = AppConfig(
-        runtime_mode="container",
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm"
-            )
-        },
         models=[
-            ModelPresetConfig(
+            ModelConfig(
                 name="gemma",
-                backend_family="rocm",
-                model=ModelSource(local_path=Path("mock.gguf")),
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        source=ModelSource(local_path=Path("mock.gguf")),
+                    )
+                },
             )
         ],
     )
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=RuntimeSettings(), app_config=app_config, hf=FakeHF()
     )
 
@@ -523,10 +519,16 @@ async def test_container_boot_crash_sets_error_state(
     monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
 
     with pytest.raises(RuntimeError, match="Container exited immediately."):
-        await manager.load("gemma")
+        await manager.load("gemma", "rocm")
 
     status = manager.status()
-    gemma_status = next(b for b in status.backends if b.name == "gemma")
+    gemma_status = next(b for b in status.models if b.name == "gemma")
     assert gemma_status.state == "error"
     assert gemma_status.last_error is not None
     assert "Container exited immediately" in gemma_status.last_error
+
+
+class MockDockerClient:
+    def __init__(self) -> None:
+        self.containers = MockContainers()
+        self.images = MockImages()

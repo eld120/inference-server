@@ -1,6 +1,6 @@
 """Tests for speculative state cleanup during model swaps.
 
-Verifies that switching from a speculative preset to a non-speculative preset
+Verifies that switching from a speculative model config to a non-speculative model config
 clears stale runtime metadata (draft_model_path), and vice versa.
 """
 
@@ -12,12 +12,12 @@ from typing import Any
 import pytest
 
 from config import RuntimeSettings
-from manager import BackendManager
+from manager import ModelRuntimeManager
 from schemas import (
     AppConfig,
-    BackendFamilyConfig,
-    ModelPresetConfig,
+    ModelConfig,
     ModelSource,
+    RuntimeConfig,
     SpeculativeConfig,
 )
 from tests.test_manager import (
@@ -33,7 +33,7 @@ async def test_speculative_to_non_speculative_clears_draft_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Switching from a speculative preset to a non-speculative one
+    """Switching from a speculative model config to a non-speculative one
     should clear draft_model_path on the runtime."""
     mock_client = MockDockerClient()
     monkeypatch.setattr("docker.from_env", lambda: mock_client)
@@ -42,41 +42,43 @@ async def test_speculative_to_non_speculative_clears_draft_path(
         return "mock_commit_123"
 
     monkeypatch.setattr(
-        "manager.BackendManager._resolve_commit_hash", fake_resolve_commit_hash
+        "manager.ModelRuntimeManager._resolve_commit_hash", fake_resolve_commit_hash
     )
 
     draft_path = tmp_path / "draft.gguf"
 
     runtime = RuntimeSettings(config_path=tmp_path / "config.json")
     app_config = AppConfig(
-        runtime_mode="router",
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                devices=["/dev/kfd", "/dev/dri"],
-            )
-        },
         models=[
-            ModelPresetConfig(
+            ModelConfig(
                 name="speculative_model",
-                backend_family="rocm",
-                model=ModelSource(local_path=tmp_path / "model_a.gguf"),
-                speculative=SpeculativeConfig(
-                    type="draft",
-                    draft_model=ModelSource(local_path=draft_path),
-                ),
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model_a.gguf"),
+                        speculative=SpeculativeConfig(
+                            type="draft",
+                            draft_model=ModelSource(local_path=draft_path),
+                        ),
+                    )
+                },
             ),
-            ModelPresetConfig(
+            ModelConfig(
                 name="plain_model",
-                backend_family="rocm",
-                model=ModelSource(local_path=tmp_path / "model_b.gguf"),
-                # No speculative config — defaults to none
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model_b.gguf"),
+                    )
+                },
             ),
         ],
     )
 
     upstream_app = MockUpstreamApp()
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=runtime,
         app_config=app_config,
         hf=FakeHF(tmp_path),
@@ -91,15 +93,15 @@ async def test_speculative_to_non_speculative_clears_draft_path(
     monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
 
     # 1. Load speculative model
-    status = await manager.load("speculative_model")
+    status = await manager.load("speculative_model", "rocm")
     assert status.active is True
     assert status.speculative_type == "draft"
     assert manager._active_runtime is not None
     assert manager._active_runtime.draft_model_path is not None
     assert manager._active_runtime.draft_model_path == draft_path.resolve().absolute()
 
-    # 2. Swap to non-speculative model (same backend family, same router)
-    status = await manager.load("plain_model")
+    # 2. Swap to non-speculative model (same runtime type)
+    status = await manager.load("plain_model", "rocm")
     assert status.active is True
     assert status.speculative_type == "none"
 
@@ -108,7 +110,7 @@ async def test_speculative_to_non_speculative_clears_draft_path(
     assert manager._active_runtime.draft_model_path is None
 
     # Status should also reflect no draft model
-    statuses = {s.name: s for s in manager.backend_statuses()}
+    statuses = {s.name: s for s in manager.model_statuses()}
     assert statuses["plain_model"].draft_model_path is None
 
 
@@ -117,7 +119,7 @@ async def test_non_speculative_to_speculative_sets_draft_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Switching from a non-speculative preset to a speculative one
+    """Switching from a non-speculative model config to a speculative one
     should correctly set draft_model_path."""
     mock_client = MockDockerClient()
     monkeypatch.setattr("docker.from_env", lambda: mock_client)
@@ -126,40 +128,43 @@ async def test_non_speculative_to_speculative_sets_draft_path(
         return "mock_commit_123"
 
     monkeypatch.setattr(
-        "manager.BackendManager._resolve_commit_hash", fake_resolve_commit_hash
+        "manager.ModelRuntimeManager._resolve_commit_hash", fake_resolve_commit_hash
     )
 
     draft_path = tmp_path / "draft.gguf"
 
     runtime = RuntimeSettings(config_path=tmp_path / "config.json")
     app_config = AppConfig(
-        runtime_mode="router",
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                devices=["/dev/kfd", "/dev/dri"],
-            )
-        },
         models=[
-            ModelPresetConfig(
+            ModelConfig(
                 name="plain_model",
-                backend_family="rocm",
-                model=ModelSource(local_path=tmp_path / "model_a.gguf"),
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model_a.gguf"),
+                    )
+                },
             ),
-            ModelPresetConfig(
+            ModelConfig(
                 name="speculative_model",
-                backend_family="rocm",
-                model=ModelSource(local_path=tmp_path / "model_b.gguf"),
-                speculative=SpeculativeConfig(
-                    type="draft",
-                    draft_model=ModelSource(local_path=draft_path),
-                ),
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model_b.gguf"),
+                        speculative=SpeculativeConfig(
+                            type="draft",
+                            draft_model=ModelSource(local_path=draft_path),
+                        ),
+                    )
+                },
             ),
         ],
     )
 
     upstream_app = MockUpstreamApp()
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=runtime,
         app_config=app_config,
         hf=FakeHF(tmp_path),
@@ -174,12 +179,12 @@ async def test_non_speculative_to_speculative_sets_draft_path(
     monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
 
     # 1. Load non-speculative model
-    await manager.load("plain_model")
+    await manager.load("plain_model", "rocm")
     assert manager._active_runtime is not None
     assert manager._active_runtime.draft_model_path is None
 
     # 2. Swap to speculative model
-    status = await manager.load("speculative_model")
+    status = await manager.load("speculative_model", "rocm")
     assert status.active is True
     assert status.speculative_type == "draft"
     assert manager._active_runtime is not None

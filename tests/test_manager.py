@@ -10,12 +10,12 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from config import RuntimeSettings
-from manager import BackendManager, ContainerRuntime, RouterRuntime
+from manager import ModelRuntimeManager, RuntimeContainer
 from schemas import (
     AppConfig,
-    BackendFamilyConfig,
-    ModelPresetConfig,
+    ModelConfig,
     ModelSource,
+    RuntimeConfig,
     SpeculativeConfig,
 )
 
@@ -168,57 +168,68 @@ class MockUpstreamApp:
                 await send(
                     {
                         "type": "http.response.body",
-                        "body": b'{"models": []}',
+                        "body": b'{"object": "list", "data": []}',
+                    }
+                )
+            else:
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 404,
+                        "headers": [],
+                    }
+                )
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b"Not Found",
                     }
                 )
 
 
-def mock_client_factory(base_url: str, app: MockUpstreamApp) -> AsyncClient:
-    return AsyncClient(
+def mock_client_factory(base_url: str, app: MockUpstreamApp) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
         transport=ASGITransport(app=app),
         base_url=base_url,
     )
 
 
 @pytest.mark.asyncio
-async def test_backend_manager_load_and_unload_router(
+async def test_model_runtime_manager_load_and_unload(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     mock_client = MockDockerClient()
     monkeypatch.setattr("docker.from_env", lambda: mock_client)
 
-    # Use a dummy commit hash mock
     async def fake_resolve_commit_hash(*args: Any, **kwargs: Any) -> str:
         return "mock_commit_123"
 
     monkeypatch.setattr(
-        "manager.BackendManager._resolve_commit_hash", fake_resolve_commit_hash
+        "manager.ModelRuntimeManager._resolve_commit_hash", fake_resolve_commit_hash
     )
 
     runtime = RuntimeSettings(
         config_path=tmp_path / "config.json",
     )
     app_config = AppConfig(
-        runtime_mode="router",
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                devices=["/dev/kfd", "/dev/dri"],
-            )
-        },
         models=[
-            ModelPresetConfig(
+            ModelConfig(
                 name="primary",
-                backend_family="rocm",
-                model=ModelSource(local_path=tmp_path / "model.gguf"),
-                speculative=SpeculativeConfig(type="draft-mtp"),
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                        speculative=SpeculativeConfig(type="draft-mtp"),
+                    )
+                },
             )
         ],
     )
 
     upstream_app = MockUpstreamApp()
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=runtime,
         app_config=app_config,
         hf=FakeHF(tmp_path),
@@ -232,16 +243,16 @@ async def test_backend_manager_load_and_unload_router(
 
     monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
 
-    status = await manager.load("primary")
+    status = await manager.load("primary", "rocm")
 
     assert status.active is True
     assert status.state == "running"
     assert status.container_id == "mock-id-123"
     assert status.model_path == str(tmp_path / "model.gguf")
-    assert manager.status().active_backend == "primary"
+    assert manager.status().active_model == "primary"
 
-    # Verify that it generated a preset file and launched a RouterRuntime
-    assert type(manager._active_runtime) is RouterRuntime
+    # Verify that it generated a llama.cpp preset INI file and launched a RuntimeContainer
+    assert type(manager._active_runtime) is RuntimeContainer
     ini_file = tmp_path / "presets" / "rocm.ini"
     assert ini_file.exists()
     assert "[primary]" in ini_file.read_text()
@@ -255,8 +266,8 @@ async def test_backend_manager_load_and_unload_router(
     assert unloaded.model_path is None
     assert len(upstream_app.unloaded_models) == 1
 
-    # Verify that backend statuses also report it as stopped
-    statuses = manager.backend_statuses()
+    # Verify that model statuses also report it as stopped
+    statuses = manager.model_statuses()
     assert len(statuses) == 1
     assert statuses[0].state == "stopped"
     assert statuses[0].active is False
@@ -265,7 +276,7 @@ async def test_backend_manager_load_and_unload_router(
 
 
 @pytest.mark.asyncio
-async def test_backend_manager_container_fallback(
+async def test_model_runtime_manager_rejects_unsupported_runtime(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -276,47 +287,32 @@ async def test_backend_manager_container_fallback(
         config_path=tmp_path / "config.json",
     )
     app_config = AppConfig(
-        runtime_mode="container",
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                devices=["/dev/kfd", "/dev/dri"],
-            )
-        },
         models=[
-            ModelPresetConfig(
+            ModelConfig(
                 name="primary",
-                backend_family="rocm",
-                model=ModelSource(local_path=tmp_path / "model.gguf"),
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
             )
         ],
     )
 
-    upstream_app = MockUpstreamApp()
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=runtime,
         app_config=app_config,
         hf=FakeHF(tmp_path),
-        proxy_client_factory=lambda base_url: mock_client_factory(
-            base_url, upstream_app
-        ),
     )
 
-    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
-        return func(*args, **kwargs)
-
-    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
-
-    status = await manager.load("primary")
-
-    assert status.active is True
-    assert type(manager._active_runtime) is ContainerRuntime
-    container = mock_client.containers.get("inference-server-primary")
-    assert container.stopped is False
+    with pytest.raises(ValueError, match="does not support runtime"):
+        await manager.load("primary", "vulkan")
 
 
 @pytest.mark.asyncio
-async def test_backend_manager_keeps_active_backend_when_new_model_fails(
+async def test_manager_keeps_active_model_when_new_model_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -327,36 +323,41 @@ async def test_backend_manager_keeps_active_backend_when_new_model_fails(
         return "mock_commit_123"
 
     monkeypatch.setattr(
-        "manager.BackendManager._resolve_commit_hash", fake_resolve_commit_hash
+        "manager.ModelRuntimeManager._resolve_commit_hash", fake_resolve_commit_hash
     )
 
     runtime = RuntimeSettings(
         config_path=tmp_path / "config.json",
     )
     app_config = AppConfig(
-        runtime_mode="router",
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                devices=["/dev/kfd", "/dev/dri"],
-            )
-        },
         models=[
-            ModelPresetConfig(
+            ModelConfig(
                 name="primary",
-                backend_family="rocm",
-                model=ModelSource(local_path=tmp_path / "model.gguf"),
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
             ),
-            ModelPresetConfig(
+            ModelConfig(
                 name="secondary",
-                backend_family="rocm",
-                model=ModelSource(repo_id="broken/repo", filename="model.gguf"),
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(
+                            repo_id="broken/repo", filename="model.gguf"
+                        ),
+                    )
+                },
             ),
         ],
     )
 
     upstream_app = MockUpstreamApp()
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=runtime,
         app_config=app_config,
         hf=FailingHF(tmp_path),
@@ -370,24 +371,24 @@ async def test_backend_manager_keeps_active_backend_when_new_model_fails(
 
     monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
 
-    await manager.load("primary")
+    await manager.load("primary", "rocm")
     with pytest.raises(ValueError):
-        await manager.load("secondary")
+        await manager.load("secondary", "rocm")
 
     svc_status = manager.status()
-    assert svc_status.active_backend is None
-    
+    assert svc_status.active_model is None
+
     # primary should be stopped
-    assert svc_status.backends[0].name == "primary"
-    assert svc_status.backends[0].state == "stopped"
-    assert svc_status.backends[0].active is False
+    assert svc_status.models[0].name == "primary"
+    assert svc_status.models[0].state == "stopped"
+    assert svc_status.models[0].active is False
 
     # secondary should be in error state
-    assert svc_status.backends[1].name == "secondary"
-    assert svc_status.backends[1].state == "error"
-    assert svc_status.backends[1].active is False
+    assert svc_status.models[1].name == "secondary"
+    assert svc_status.models[1].state == "error"
+    assert svc_status.models[1].active is False
 
-    container = mock_client.containers.get("inference-server-router-rocm")
+    container = mock_client.containers.get("inference-server-runtime-rocm")
     assert container.stopped is False
 
 
@@ -403,24 +404,22 @@ async def test_global_cleanup_stops_only_labeled_containers(
         config_path=tmp_path / "config.json",
     )
     app_config = AppConfig(
-        runtime_mode="container",
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                devices=["/dev/kfd", "/dev/dri"],
-            )
-        },
         models=[
-            ModelPresetConfig(
-                name="backend1",
-                backend_family="rocm",
-                model=ModelSource(local_path=tmp_path / "m1.gguf"),
+            ModelConfig(
+                name="model1",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "m1.gguf"),
+                    )
+                },
             )
         ],
     )
 
     upstream_app = MockUpstreamApp()
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=runtime,
         app_config=app_config,
         hf=FakeHF(tmp_path),
@@ -434,7 +433,7 @@ async def test_global_cleanup_stops_only_labeled_containers(
 
     monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
 
-    await manager.load("backend1")
+    await manager.load("model1", "rocm")
 
     unmanaged_container = MockContainer(
         name="some-other-database", labels={"managed-by": "other-app"}
@@ -445,7 +444,7 @@ async def test_global_cleanup_stops_only_labeled_containers(
 
     await manager.cleanup()
 
-    managed = mock_client.containers.get("inference-server-backend1")
+    managed = mock_client.containers.get("inference-server-runtime-rocm")
     assert managed.stopped is True
     assert unmanaged_container.stopped is False
 
@@ -462,18 +461,16 @@ async def test_open_proxy_session_closes_client_on_send_failure(
         config_path=tmp_path / "config.json",
     )
     app_config = AppConfig(
-        runtime_mode="container",
-        backend_families={
-            "rocm": BackendFamilyConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                devices=["/dev/kfd", "/dev/dri"],
-            )
-        },
         models=[
-            ModelPresetConfig(
+            ModelConfig(
                 name="primary",
-                backend_family="rocm",
-                model=ModelSource(local_path=tmp_path / "model.gguf"),
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
             )
         ],
     )
@@ -504,7 +501,7 @@ async def test_open_proxy_session_closes_client_on_send_failure(
         clients.append(client)
         return client
 
-    manager = BackendManager(
+    manager = ModelRuntimeManager(
         runtime=runtime,
         app_config=app_config,
         hf=FakeHF(tmp_path),
@@ -512,9 +509,9 @@ async def test_open_proxy_session_closes_client_on_send_failure(
     )
     # mock starting state
     manager._active_model_name = "primary"
-    preset = manager._get_preset("primary")
-    manager._active_runtime = ContainerRuntime(
-        preset, app_config.backend_families["rocm"], manager
+    model_config = manager._get_model_config("primary")
+    manager._active_runtime = RuntimeContainer(
+        "rocm", "primary", model_config.runtimes["rocm"], manager
     )
 
     request = httpx.Request("POST", "http://placeholder/v1/chat/completions")
@@ -524,3 +521,173 @@ async def test_open_proxy_session_closes_client_on_send_failure(
 
     assert len(clients) == 1
     assert clients[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_unload_failure_preserves_runtime_state_and_honors_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    async def fake_resolve_commit_hash(*args: Any, **kwargs: Any) -> str:
+        return "mock_commit_123"
+
+    monkeypatch.setattr(
+        "manager.ModelRuntimeManager._resolve_commit_hash", fake_resolve_commit_hash
+    )
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    upstream_app = MockUpstreamApp()
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+        proxy_client_factory=lambda base_url: mock_client_factory(
+            base_url, upstream_app
+        ),
+    )
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    # 1. Load successfully first
+    await manager.load("primary", "rocm")
+    assert manager._active_model_name == "primary"
+    assert manager._active_runtime is not None
+
+    # Now make container.stop and container.remove fail
+    container = manager._active_runtime.container
+    assert container is not None
+
+    def failing_stop(*args, **kwargs):
+        raise RuntimeError("Stop failed")
+
+    def failing_remove(*args, **kwargs):
+        raise RuntimeError("Remove failed")
+
+    container.stop = failing_stop
+    container.remove = failing_remove
+
+    # 2. Try to unload. It should fail to stop/remove and propagate the exception.
+    with pytest.raises(RuntimeError, match="Remove failed"):
+        await manager.unload("primary")
+
+    # 3. State must be preserved (not cleared) and set to error state
+    assert manager._active_model_name == "primary"
+    assert manager._active_runtime is not None
+    assert manager._active_runtime.state == "error"
+    assert "Stop failed" in manager._active_runtime.last_error
+
+    # 4. status() must reflect the error honestly
+    svc_status = manager.status()
+    assert svc_status.healthy is False
+    assert svc_status.active_model == "primary"
+    assert svc_status.active_runtime == "rocm"
+    assert svc_status.active_container_id == container.id
+    assert "Stop failed" in svc_status.last_error
+
+    # 5. Successful unload after fixing container stop/remove
+    # Restore container stop and remove to succeed
+    container.stop = lambda *args, **kwargs: None
+    container.remove = lambda *args, **kwargs: None
+
+    unloaded = await manager.unload("primary")
+    assert unloaded is not None
+    assert manager._active_model_name is None
+    assert manager._active_runtime is None
+
+    svc_status2 = manager.status()
+    assert svc_status2.healthy is True
+    assert svc_status2.active_model is None
+    assert svc_status2.active_runtime is None
+    assert svc_status2.active_container_id is None
+
+
+@pytest.mark.asyncio
+async def test_manager_no_model_loaded_error(tmp_path: Path) -> None:
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(models=[])
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+    )
+    request = httpx.Request("POST", "http://localhost:8000/v1/chat/completions")
+    with pytest.raises(RuntimeError, match="no model is loaded"):
+        await manager.open_proxy_session("/v1/chat/completions", request)
+
+
+@pytest.mark.asyncio
+async def test_runtime_timeout_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="gemma",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        source=ModelSource(local_path=tmp_path / "gemma.gguf"),
+                    )
+                },
+            )
+        ]
+    )
+
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+    )
+    manager._docker_client = MockDockerClient()
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    class MockLoop:
+        def __init__(self) -> None:
+            self.current_time = 0.0
+        def time(self) -> float:
+            return self.current_time
+
+    mock_loop = MockLoop()
+    monkeypatch.setattr("manager.asyncio.get_running_loop", lambda: mock_loop)
+
+    async def fake_sleep(seconds: float) -> None:
+        mock_loop.current_time += seconds
+
+    monkeypatch.setattr("manager.asyncio.sleep", fake_sleep)
+
+    class FailingClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def get(self, url):
+            raise httpx.RequestError("Mock connection failure")
+
+    monkeypatch.setattr(manager, "create_proxy_client", lambda base_url: FailingClient())
+
+    with pytest.raises(TimeoutError, match="runtime did not become ready in time"):
+        await manager.load("gemma", "rocm")
+

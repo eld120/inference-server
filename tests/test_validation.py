@@ -10,12 +10,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from schemas import (
     AppConfig,
-    BackendFamilyConfig,
-    ModelPresetConfig,
+    ModelConfig,
     ModelSource,
+    RuntimeConfig,
     SpeculativeConfig,
 )
 
@@ -80,111 +81,105 @@ def test_speculative_ngram_types_ok() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AppConfig validation: unique preset names
+# AppConfig validation: unique model names
 # ---------------------------------------------------------------------------
 
-_ROCM_FAMILY = BackendFamilyConfig(
-    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm"
+_ROCM_RUNTIME = RuntimeConfig(
+    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+    source=ModelSource(local_path=Path("/models/main.gguf")),
 )
 
 
-def _preset(name: str, *, family: str = "rocm") -> ModelPresetConfig:
-    return ModelPresetConfig(
+def _model_cfg(name: str) -> ModelConfig:
+    return ModelConfig(
         name=name,
-        backend_family=family,
-        model=ModelSource(local_path=Path(f"/models/{name}.gguf")),
+        runtimes={"rocm": _ROCM_RUNTIME},
     )
 
 
-def test_duplicate_preset_names_rejected() -> None:
-    with pytest.raises(ValueError, match="duplicate preset name"):
+def test_duplicate_model_names_rejected() -> None:
+    with pytest.raises(ValueError, match="duplicate model name"):
         AppConfig(
-            backend_families={"rocm": _ROCM_FAMILY},
-            models=[_preset("gemma"), _preset("gemma")],
+            models=[_model_cfg("gemma"), _model_cfg("gemma")],
         )
 
 
-def test_unique_preset_names_ok() -> None:
+def test_unique_model_names_ok() -> None:
     config = AppConfig(
-        backend_families={"rocm": _ROCM_FAMILY},
-        models=[_preset("gemma"), _preset("qwen")],
+        models=[_model_cfg("gemma"), _model_cfg("qwen")],
     )
     assert len(config.models) == 2
 
 
 # ---------------------------------------------------------------------------
-# AppConfig validation: backend family references
+# AppConfig validation: runtime config checks
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_backend_family_rejected() -> None:
-    with pytest.raises(ValueError, match="unknown backend family.*vulkan"):
-        AppConfig(
-            backend_families={"rocm": _ROCM_FAMILY},
-            models=[_preset("gemma", family="vulkan")],
+def test_no_runtimes_rejected() -> None:
+    with pytest.raises(ValidationError, match="must have at least one runtime"):
+        ModelConfig(
+            name="gemma",
+            runtimes={},
         )
 
 
-def test_valid_backend_family_ok() -> None:
-    config = AppConfig(
-        backend_families={"rocm": _ROCM_FAMILY},
-        models=[_preset("gemma", family="rocm")],
-    )
-    assert config.models[0].backend_family == "rocm"
-
-
-# ---------------------------------------------------------------------------
-# AppConfig validation: explicit model source
-# ---------------------------------------------------------------------------
+def test_unknown_runtime_key_rejected() -> None:
+    with pytest.raises(ValidationError, match="should be 'rocm' or 'vulkan'"):
+        ModelConfig.model_validate(
+            {
+                "name": "gemma",
+                "runtimes": {
+                    "invalid_key": {
+                        "docker_image": "img",
+                        "source": {"local_path": "/models/model.gguf"},
+                    }
+                },
+            }
+        )
 
 
 def test_model_source_repo_id_without_filename_rejected() -> None:
-    with pytest.raises(ValueError, match="model source must specify"):
-        AppConfig(
-            backend_families={"rocm": _ROCM_FAMILY},
-            models=[
-                ModelPresetConfig(
-                    name="bad",
-                    backend_family="rocm",
-                    model=ModelSource(repo_id="org/model"),
+    with pytest.raises(ValidationError, match="model source must specify"):
+        ModelConfig(
+            name="bad",
+            runtimes={
+                "rocm": RuntimeConfig(
+                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                    source=ModelSource(repo_id="org/model"),
                 )
-            ],
+            },
         )
 
 
 def test_model_source_repo_id_with_filename_ok() -> None:
-    config = AppConfig(
-        backend_families={"rocm": _ROCM_FAMILY},
-        models=[
-            ModelPresetConfig(
-                name="good",
-                backend_family="rocm",
-                model=ModelSource(repo_id="org/model", filename="model.gguf"),
+    config = ModelConfig(
+        name="good",
+        runtimes={
+            "rocm": RuntimeConfig(
+                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                source=ModelSource(repo_id="org/model", filename="model.gguf"),
             )
-        ],
+        },
     )
-    assert config.models[0].model.filename == "model.gguf"
+    assert config.runtimes["rocm"].source.filename == "model.gguf"
 
 
 def test_model_source_local_path_ok() -> None:
-    config = AppConfig(
-        backend_families={"rocm": _ROCM_FAMILY},
-        models=[_preset("local")],
-    )
-    assert config.models[0].model.local_path is not None
+    config = _model_cfg("local")
+    assert config.runtimes["rocm"].source.local_path is not None
 
 
 def test_model_source_empty_rejected() -> None:
-    with pytest.raises(ValueError, match="model source must specify"):
-        AppConfig(
-            backend_families={"rocm": _ROCM_FAMILY},
-            models=[
-                ModelPresetConfig(
-                    name="empty",
-                    backend_family="rocm",
-                    model=ModelSource(),
+    with pytest.raises(ValidationError, match="model source must specify"):
+        ModelConfig(
+            name="empty",
+            runtimes={
+                "rocm": RuntimeConfig(
+                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                    source=ModelSource(),
                 )
-            ],
+            },
         )
 
 
@@ -194,44 +189,38 @@ def test_model_source_empty_rejected() -> None:
 
 
 def test_draft_model_source_must_be_explicit() -> None:
-    with pytest.raises(ValueError, match="draft_model source must"):
-        AppConfig(
-            backend_families={"rocm": _ROCM_FAMILY},
-            models=[
-                ModelPresetConfig(
-                    name="bad_draft",
-                    backend_family="rocm",
-                    model=ModelSource(local_path=Path("/models/main.gguf")),
+    with pytest.raises(ValidationError, match="draft_model source must"):
+        ModelConfig(
+            name="bad_draft",
+            runtimes={
+                "rocm": RuntimeConfig(
+                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                    source=ModelSource(local_path=Path("/models/main.gguf")),
                     speculative=SpeculativeConfig(
                         type="draft",
                         draft_model=ModelSource(repo_id="org/draft"),
                     ),
                 )
-            ],
+            },
         )
 
 
 def test_draft_model_with_local_path_ok() -> None:
-    config = AppConfig(
-        backend_families={"rocm": _ROCM_FAMILY},
-        models=[
-            ModelPresetConfig(
-                name="good_draft",
-                backend_family="rocm",
-                model=ModelSource(local_path=Path("/models/main.gguf")),
+    config = ModelConfig(
+        name="good_draft",
+        runtimes={
+            "rocm": RuntimeConfig(
+                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                source=ModelSource(local_path=Path("/models/main.gguf")),
                 speculative=SpeculativeConfig(
                     type="draft",
-                    draft_model=ModelSource(
-                        local_path=Path("/models/draft.gguf")
-                    ),
+                    draft_model=ModelSource(local_path=Path("/models/draft.gguf")),
                 ),
             )
-        ],
+        },
     )
-    assert config.models[0].speculative.draft_model is not None
+    assert config.runtimes["rocm"].speculative.draft_model is not None
 
-
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # AppConfig validation: empty config is valid
@@ -241,42 +230,15 @@ def test_draft_model_with_local_path_ok() -> None:
 def test_empty_config_valid() -> None:
     config = AppConfig()
     assert config.models == []
-    assert config.backend_families == {}
 
 
 # ---------------------------------------------------------------------------
-# AppConfig validation: multiple errors reported
+# AppConfig validation: nested unknown fields rejected
 # ---------------------------------------------------------------------------
-
-
-def test_multiple_errors_reported_together() -> None:
-    """Multiple validation failures should be reported in a single error."""
-    with pytest.raises(ValueError, match="invalid configuration") as exc_info:
-        AppConfig(
-            backend_families={"rocm": _ROCM_FAMILY},
-            models=[
-                ModelPresetConfig(
-                    name="bad1",
-                    backend_family="vulkan",  # unknown family
-                    model=ModelSource(repo_id="org/model"),  # missing filename
-                ),
-                ModelPresetConfig(
-                    name="bad1",  # duplicate name
-                    backend_family="rocm",
-                    model=ModelSource(local_path=Path("/ok.gguf")),
-                ),
-            ],
-        )
-    error_msg = str(exc_info.value)
-    assert "duplicate preset name" in error_msg
-    assert "unknown backend family" in error_msg
-    assert "model source must specify" in error_msg
 
 
 def test_nested_unknown_fields_rejected() -> None:
     """Unknown keys inside nested configuration objects should be rejected."""
-    from pydantic import ValidationError
-
     # 1. ModelSource unknown field
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         ModelSource.model_validate({"repo_id": "foo/bar", "unknown_field": "val"})
@@ -285,19 +247,27 @@ def test_nested_unknown_fields_rejected() -> None:
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         SpeculativeConfig.model_validate({"type": "none", "unknown_field": "val"})
 
-    # 3. BackendFamilyConfig unknown field
+    # 3. RuntimeConfig unknown field
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        BackendFamilyConfig.model_validate(
-            {"docker_image": "img", "unknown_field": "val"}
+        RuntimeConfig.model_validate(
+            {
+                "docker_image": "img",
+                "source": {"local_path": "/ok.gguf"},
+                "unknown_field": "val",
+            }
         )
 
-    # 4. ModelPresetConfig unknown field
+    # 4. ModelConfig unknown field
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        ModelPresetConfig.model_validate(
+        ModelConfig.model_validate(
             {
                 "name": "gemma",
-                "backend_family": "rocm",
-                "model": {"local_path": "/ok.gguf"},
+                "runtimes": {
+                    "rocm": {
+                        "docker_image": "img",
+                        "source": {"local_path": "/ok.gguf"},
+                    }
+                },
                 "unknown_field": "val",
             }
         )
