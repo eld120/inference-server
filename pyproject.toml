@@ -1,7 +1,7 @@
 [project]
 name = "inference-server"
 version = "0.1.0"
-description = "Add your description here"
+description = "Local LLM gateway and orchestrator for Docker-backed inference runtimes"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -15,9 +15,6 @@ dependencies = [
     "uvicorn[standard]>=0.47.0",
 ]
 
-[project.scripts]
-inference-server = "main:main"
-
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
@@ -26,6 +23,9 @@ dev = [
     "ruff>=0.15.13",
     "ty>=0.0.38",
 ]
+
+[tool.uv]
+package = false
 
 [tool.pytest.ini_options]
 addopts = "--cov --cov-report=term-missing"
