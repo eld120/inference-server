@@ -6,13 +6,23 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 from config import RuntimeSettings, effective_hf_token, load_app_config
 from hf import HuggingFaceService
-from manager import BackendManager
-from protocols import BackendManagerProtocol, HuggingFaceServiceProtocol
-from schemas import AppConfig
+from manager import ModelRuntimeManager
+from protocols import ModelRuntimeManagerProtocol, HuggingFaceServiceProtocol
+from schemas import (
+    AppConfig,
+    HealthResponse,
+    LoadModelRequest,
+    LogsResponse,
+    ModelResource,
+    ModelsResponse,
+    OpenAIModelListResponse,
+    OpenAIModelSummary,
+    ServiceStatus,
+)
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -44,11 +54,19 @@ def _filtered_request_headers(headers: Mapping[str, str]) -> dict[str, str]:
     }
 
 
+def _manager_active_model(manager: ModelRuntimeManagerProtocol):
+    return manager.active_model()
+
+
+def _manager_find_model(manager: ModelRuntimeManagerProtocol, model_name: str) -> str | None:
+    return manager.find_model_for_name(model_name)
+
+
 def create_app(
     runtime: RuntimeSettings | None = None,
     app_config: AppConfig | None = None,
     hf: HuggingFaceServiceProtocol | None = None,
-    manager: BackendManagerProtocol | None = None,
+    manager: ModelRuntimeManagerProtocol | None = None,
 ) -> FastAPI:
     runtime = runtime or RuntimeSettings()
     app_config = app_config or load_app_config(runtime.config_path)
@@ -57,7 +75,7 @@ def create_app(
         cache_dir=app_config.hf_cache_dir,
         token=effective_hf_token(runtime, app_config),
     )
-    manager = manager or BackendManager(runtime=runtime, app_config=app_config, hf=hf)
+    manager = manager or ModelRuntimeManager(runtime=runtime, app_config=app_config, hf=hf)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -68,48 +86,57 @@ def create_app(
     app.state.manager = manager
     app.state.hf = hf
 
-    @app.get(f"{api_prefix}/healthz")
-    async def healthz() -> dict[str, bool]:
-        return {"ok": True}
+    @app.get(f"{api_prefix}/health", response_model=HealthResponse)
+    async def health() -> HealthResponse:
+        return HealthResponse()
 
-    @app.get(f"{api_prefix}/status")
-    async def status() -> JSONResponse:
-        return JSONResponse(manager.status().model_dump())
+    @app.get(f"{api_prefix}/status", response_model=ServiceStatus)
+    async def status() -> ServiceStatus:
+        return manager.status()
 
-    @app.get(f"{api_prefix}/backends")
-    async def backends() -> JSONResponse:
-        backends = [backend.model_dump() for backend in manager.backend_statuses()]
-        return JSONResponse({"backends": backends})
+    @app.get(f"{api_prefix}/models", response_model=ModelsResponse)
+    async def models() -> ModelsResponse:
+        return ModelsResponse(models=manager.model_resources())
 
-    @app.post(f"{api_prefix}/backends/{{name}}/load")
-    async def load_backend(name: str) -> JSONResponse:
+    @app.get(f"{api_prefix}/models/{{name}}", response_model=ModelResource)
+    async def model(name: str) -> ModelResource:
         try:
-            status = await manager.load(name)
+            return manager.model_resource(name)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post(f"{api_prefix}/models/{{name}}/load", response_model=ModelResource)
+    async def load_model(name: str, body: LoadModelRequest) -> ModelResource:
+        try:
+            status = await manager.load(name, body.runtime)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=str(exc)) from exc
-        return JSONResponse(status.model_dump())
+        return status
 
-    @app.post(f"{api_prefix}/backends/{{name}}/unload")
-    async def unload_backend(name: str) -> JSONResponse:
+    @app.post(f"{api_prefix}/models/{{name}}/unload", response_model=ModelResource)
+    async def unload_model(name: str) -> ModelResource:
         try:
             status = await manager.unload(name)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         if status is None:
-            return JSONResponse({"ok": True})
-        return JSONResponse(status.model_dump())
+            raise HTTPException(
+                status_code=409,
+                detail=f"Model '{name}' is not currently active.",
+            )
+        return status
 
-    @app.get(f"{api_prefix}/backends/{{name}}/logs")
-    async def backend_logs(name: str) -> JSONResponse:
+    @app.get(f"{api_prefix}/models/{{name}}/logs", response_model=LogsResponse)
+    async def model_logs(name: str) -> LogsResponse:
         try:
             logs = await manager.get_logs(name)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return JSONResponse({"name": name, "logs": logs})
-
-
+        return LogsResponse(name=name, logs=logs)
 
     async def _proxy(request: Request, path: str) -> Response:
         body = await request.body()
@@ -128,20 +155,20 @@ def create_app(
             except Exception:
                 pass
 
-        target_backend: str | None = None
-        active = manager.active_backend()
+        target_model: str | None = None
+        active = _manager_active_model(manager)
 
         if model_name:
             # Verify model is configured
-            target_backend = manager.find_backend_for_model(model_name)
-            if target_backend is None:
+            target_model = _manager_find_model(manager, model_name)
+            if target_model is None:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Requested model '{model_name}' is not configured.",
                 )
 
             # Verify configured model matches currently loaded model
-            if active is None or active.config.name != target_backend:
+            if active is None or active.config.name != target_model:
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -156,14 +183,15 @@ def create_app(
                     status_code=400,
                     detail="No model is currently loaded.",
                 )
-            target_backend = active.config.name
+            target_model = active.config.name
 
-        # Rewrite model name in the JSON body so that the router routes it correctly
-        if target_backend and is_json and data is not None:
+        # Rewrite model name in the JSON body so that the runtime container
+        # processes it correctly
+        if target_model and is_json and data is not None:
             try:
                 import json
 
-                data["model"] = target_backend
+                data["model"] = target_model
                 body = json.dumps(data).encode("utf-8")
             except Exception:
                 pass
@@ -183,7 +211,7 @@ def create_app(
         except (RuntimeError, httpx.HTTPError) as exc:
             raise HTTPException(
                 status_code=503,
-                detail=f"Backend communication failure: {exc}",
+                detail=f"Model runtime communication failure: {exc}",
             ) from exc
 
         upstream_response = session.response
@@ -222,27 +250,29 @@ def create_app(
             finally:
                 await asyncio.shield(session.client.aclose())
 
-    @app.get(f"{api_prefix}/v1/models")
-    @app.get(f"{api_prefix}/v1/models/")
-    async def list_v1_models() -> JSONResponse:
+    @app.get(f"{api_prefix}/v1/models", response_model=OpenAIModelListResponse)
+    async def list_v1_models() -> OpenAIModelListResponse:
         import time
+
         created_time = int(time.time())
         data = [
-            {
-                "id": m.name,
-                "object": "model",
-                "created": created_time,
-                "owned_by": "inference-server",
-            }
-            for m in manager.backends()
+            OpenAIModelSummary(
+                id=m.name,
+                created=created_time,
+                owned_by="inference-server",
+            )
+            for m in manager.models()
         ]
-        return JSONResponse({"object": "list", "data": data})
+        return OpenAIModelListResponse(data=data)
 
-    @app.get(f"{api_prefix}/v1/models/{{model_name}}")
-    async def retrieve_v1_model(model_name: str) -> JSONResponse:
+    @app.get(
+        f"{api_prefix}/v1/models/{{model_name}}", response_model=OpenAIModelSummary
+    )
+    async def retrieve_v1_model(model_name: str) -> OpenAIModelSummary:
         import time
+
         found = None
-        for m in manager.backends():
+        for m in manager.models():
             if m.name == model_name:
                 found = m
                 break
@@ -251,30 +281,24 @@ def create_app(
                 status_code=404,
                 detail=f"Model '{model_name}' not found in configuration.",
             )
-        return JSONResponse({
-            "id": found.name,
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": "inference-server",
-        })
+        return OpenAIModelSummary(
+            id=found.name,
+            created=int(time.time()),
+            owned_by="inference-server",
+        )
 
     @app.api_route(
         f"{api_prefix}/v1",
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        include_in_schema=False,
     )
     async def api_v1_root(request: Request) -> Response:
         return await _proxy(request, "v1")
 
     @app.api_route(
-        f"{api_prefix}/v1/",
-        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    )
-    async def api_v1_root_slash(request: Request) -> Response:
-        return await _proxy(request, "v1")
-
-    @app.api_route(
         f"{api_prefix}/v1/{{path:path}}",
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        include_in_schema=False,
     )
     async def api_v1_proxy(request: Request, path: str) -> Response:
         return await _proxy(request, f"v1/{path}")
