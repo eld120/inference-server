@@ -19,7 +19,12 @@ class RuntimeSettings(BaseSettings):
     config_path: Path = Field(default_factory=default_config_path)
     host: str = "0.0.0.0"
     port: int = 8000
-    backend_port: int = 39281
+    runtime_port: int = Field(
+        default=39281,
+        validation_alias=AliasChoices(
+            "INF_RUNTIME_PORT", "INF_BACKEND_PORT"
+        ),
+    )
     hf_token: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
