@@ -7,13 +7,14 @@ from typing import Protocol
 import httpx
 
 from schemas import (
-    BackendStatus,
     HFCachedFile,
     HFDownloadResponse,
     HFRepoFile,
     HFSearchResult,
-    ModelPresetConfig,
+    ModelConfig,
+    ModelResource,
     ModelSource,
+    ModelStatus,
     ServiceStatus,
 )
 
@@ -56,20 +57,24 @@ class ProxySessionProtocol(Protocol):
     response: httpx.Response
 
 
-class ActiveBackendProtocol(Protocol):
-    config: ModelPresetConfig
+class ActiveModelProtocol(Protocol):
+    config: ModelConfig
 
 
-class BackendManagerProtocol(Protocol):
+class ModelRuntimeManagerProtocol(Protocol):
     def status(self) -> ServiceStatus: ...
 
-    def backend_statuses(self) -> list[BackendStatus]: ...
+    def model_statuses(self) -> list[ModelStatus]: ...
 
-    async def load(self, name: str) -> BackendStatus: ...
+    def model_resources(self) -> list[ModelResource]: ...
 
-    async def unload(self, name: str | None = None) -> BackendStatus | None: ...
+    def model_resource(self, name: str) -> ModelResource: ...
 
-    def active_backend(self) -> ActiveBackendProtocol | None: ...
+    async def load(self, name: str, runtime: str) -> ModelResource: ...
+
+    async def unload(self, name: str | None = None) -> ModelResource | None: ...
+
+    def active_model(self) -> ActiveModelProtocol | None: ...
 
     async def open_proxy_session(
         self, path: str, request: httpx.Request
@@ -79,6 +84,6 @@ class BackendManagerProtocol(Protocol):
 
     async def cleanup(self) -> None: ...
 
-    def find_backend_for_model(self, model_name: str) -> str | None: ...
+    def models(self) -> list[ModelConfig]: ...
 
-    def backends(self) -> list[ModelPresetConfig]: ...
+    def find_model_for_name(self, model_name: str) -> str | None: ...
