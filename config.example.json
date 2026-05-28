@@ -1,62 +1,65 @@
 {
-  "runtime_mode": "auto",
   "api_prefix": "/api",
   "hf_cache_dir": "/home/you/.cache/huggingface/hub",
   "hf_token": null,
-  "backend_families": {
-    "rocm": {
-      "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
-      "devices": [
-        "/dev/kfd",
-        "/dev/dri"
-      ],
-      "volumes": {},
-      "shared_args": [
-        "-ngl", "99"
-      ],
-      "router_supported": true
-    },
-    "vulkan": {
-      "docker_image": "ghcr.io/ggerganov/llama.cpp:server-vulkan",
-      "devices": [
-        "/dev/dri"
-      ],
-      "volumes": {},
-      "shared_args": [
-        "-ngl", "99"
-      ],
-      "router_supported": true
-    }
-  },
   "models": [
     {
       "name": "gemma",
-      "backend_family": "rocm",
-      "bind_host": "127.0.0.1",
-      "connect_host": "127.0.0.1",
-      "model": {
-        "repo_id": "ggml-org/gemma-3-1b-it-GGUF",
-        "filename": "gemma-3-1b-it-Q4_K_M.gguf",
-        "revision": "main"
-      },
-      "speculative": {
-        "type": "draft-mtp"
-      },
-      "extra_args": []
+      "runtimes": {
+        "rocm": {
+          "source": {
+            "repo_id": "ggml-org/gemma-3-1b-it-GGUF",
+            "filename": "gemma-3-1b-it-Q4_K_M.gguf",
+            "revision": "main"
+          },
+          "devices": [
+            "/dev/kfd",
+            "/dev/dri"
+          ],
+          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
+          "shared_args": [
+            "-ngl",
+            "99"
+          ],
+          "extra_args": []
+        },
+        "vulkan": {
+          "source": {
+            "repo_id": "ggml-org/gemma-3-1b-it-GGUF",
+            "filename": "gemma-3-1b-it-Q4_K_M.gguf",
+            "revision": "main"
+          },
+          "devices": [
+            "/dev/dri"
+          ],
+          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-vulkan",
+          "shared_args": [
+            "-ngl",
+            "99"
+          ],
+          "extra_args": []
+        }
+      }
     },
     {
       "name": "qwen",
-      "backend_family": "vulkan",
-      "bind_host": "127.0.0.1",
-      "connect_host": "127.0.0.1",
-      "model": {
-        "repo_id": "Qwen/Qwen2.5-3B-Instruct-GGUF",
-        "filename": "qwen2.5-3b-instruct-q4_k_m.gguf",
-        "revision": "main"
-      },
-      "extra_args": [
-        "-c", "8192"
-      ]
+      "runtimes": {
+        "vulkan": {
+          "source": {
+            "repo_id": "Qwen/Qwen2.5-3B-Instruct-GGUF",
+            "filename": "qwen2.5-3b-instruct-q4_k_m.gguf",
+            "revision": "main"
+          },
+          "devices": [
+            "/dev/dri"
+          ],
+          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-vulkan",
+          "extra_args": [
+            "-c",
+            "8192"
+          ]
+        }
+      }
     }
   ]
 }
