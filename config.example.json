@@ -1,63 +1,127 @@
 {
   "api_prefix": "/api",
-  "hf_cache_dir": "/home/you/.cache/huggingface/hub",
-  "hf_token": null,
+  "hf_cache_dir": "~/.cache/huggingface/hub",
+  "hf_token": "your_huggingface_token_here",
   "models": [
     {
-      "name": "gemma",
+      "name": "qwen3.6-27b-mtp-example",
       "runtimes": {
         "rocm": {
           "source": {
-            "repo_id": "ggml-org/gemma-3-1b-it-GGUF",
-            "filename": "gemma-3-1b-it-Q4_K_M.gguf",
+            "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
+            "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
             "revision": "main"
           },
+          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
           "devices": [
             "/dev/kfd",
             "/dev/dri"
           ],
-          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
           "shared_args": [
-            "-ngl",
-            "99"
+            "-ngl", "99",
+            "-c", "96000",
+            "-fa", "on",
+            "-np", "1",
+            "--no-mmap",
+            "--cache-prompt",
+            "--cache-type-k", "q8_0",
+            "--cache-type-v", "q8_0"
           ],
-          "extra_args": []
+          "extra_args": [
+            "--spec-type", "draft-mtp",
+            "--spec-draft-n-max", "2"
+          ]
         },
         "vulkan": {
           "source": {
-            "repo_id": "ggml-org/gemma-3-1b-it-GGUF",
-            "filename": "gemma-3-1b-it-Q4_K_M.gguf",
+            "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
+            "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
             "revision": "main"
           },
+          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-vulkan",
           "devices": [
             "/dev/dri"
           ],
-          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-vulkan",
           "shared_args": [
-            "-ngl",
-            "99"
+            "-ngl", "99",
+            "-c", "96000",
+            "-fa", "on",
+            "-np", "1",
+            "--no-mmap",
+            "--cache-prompt",
+            "--cache-type-k", "q8_0",
+            "--cache-type-v", "q8_0"
           ],
-          "extra_args": []
+          "extra_args": [
+            "--spec-type", "draft-mtp",
+            "--spec-draft-n-max", "2"
+          ]
         }
       }
     },
     {
-      "name": "qwen",
+      "name": "qwen3.6-27b-vision-example",
       "runtimes": {
-        "vulkan": {
+        "rocm": {
           "source": {
-            "repo_id": "Qwen/Qwen2.5-3B-Instruct-GGUF",
-            "filename": "qwen2.5-3b-instruct-q4_k_m.gguf",
+            "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
+            "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
             "revision": "main"
           },
+          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
           "devices": [
+            "/dev/kfd",
             "/dev/dri"
           ],
-          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-vulkan",
+          "shared_args": [
+            "-ngl", "99",
+            "-c", "96000",
+            "-fa", "on",
+            "-np", "1",
+            "--no-mmap",
+            "--cache-prompt",
+            "--cache-type-k", "q8_0",
+            "--cache-type-v", "q8_0"
+          ],
           "extra_args": [
-            "-c",
-            "8192"
+            "--mmproj", "mmproj-BF16.gguf"
           ]
+        }
+      }
+    },
+    {
+      "name": "gemma-4-31b-speculative-example",
+      "runtimes": {
+        "rocm": {
+          "source": {
+            "repo_id": "unsloth/gemma-4-31B-it-GGUF",
+            "filename": "gemma-4-31B-it-UD-Q4_K_XL.gguf",
+            "revision": "main"
+          },
+          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
+          "devices": [
+            "/dev/kfd",
+            "/dev/dri"
+          ],
+          "shared_args": [
+            "-ngl", "99",
+            "-c", "96000",
+            "-fa", "on",
+            "-np", "1",
+            "--no-mmap",
+            "--cache-prompt",
+            "--cache-type-k", "q8_0",
+            "--cache-type-v", "q8_0"
+          ],
+          "extra_args": [],
+          "speculative": {
+            "type": "draft",
+            "draft_model": {
+              "repo_id": "google/gemma-4-31B-it-assistant",
+              "filename": "gemma-4-31b-it-assistant-Q4_K_M.gguf",
+              "revision": "main"
+            }
+          }
         }
       }
     }

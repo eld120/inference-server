@@ -79,14 +79,31 @@ Configured via the `speculative` field under a runtime:
 
 Supported speculative types:
 - `none`
-- `draft` (Requires `draft_model`)
+- `draft` (Requires `draft_model`, typically used for separate assistant models like Gemma 4 Assistant)
 - `draft-simple` (Requires `draft_model`)
-- `draft-mtp`
+- `draft-mtp` (Self-contained Multi-Token Prediction, e.g., for Qwen 3.6 MTP models)
 - `ngram-cache`
 - `ngram-simple`
 - `ngram-map-k`
 - `ngram-map-k4v`
 - `ngram-mod`
+
+### Multimodal / Vision Models
+
+When running multimodal models that require a vision projection adapter (like Qwen 3.6 VL), configure the main model as the `source` and add the `--mmproj` flag to `extra_args`:
+
+* Format: `["--mmproj", "mmproj-BF16.gguf"]` (or target projector filename).
+* The orchestrator will automatically resolve and download the projector file from Hugging Face (assuming it resides in the same repository as the base model), and map its location into the container path correctly.
+
+### Disk I/O & Memory Optimizations (HDD / VRAM Balance)
+
+* **Prompt Caching**: `llama-server` manages prompt caching entirely in memory (RAM/VRAM) within active slots. No disk writes are performed for prompt caching.
+* **HDD Bottlenecking (`--no-mmap`)**: If running on a slow HDD, add `--no-mmap` to `shared_args`. This forces llama.cpp to load the entire model sequentially into memory at startup, preventing slow on-demand page faults during token generation.
+* **KV Cache Quantization**: Reduce KV memory footprints using `--cache-type-k q8_0 --cache-type-v q8_0` (or `q4_0` for extreme savings) along with `-fa on` (Flash Attention).
+* **VRAM Limits vs Context Size**: For a 32GB VRAM GPU running 27B parameter models:
+  * **Q4 model quants**: Use context size `-c 96000` (fits with Q8 KV Cache).
+  * **Q5 model quants**: Use context size `-c 64000` (fits with Q8 KV Cache).
+  * **Q6 model quants**: Use context size `-c 48000` (fits with Q8 KV Cache).
 
 ---
 
