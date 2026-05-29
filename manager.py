@@ -536,6 +536,27 @@ class ModelRuntimeManager:
                             rt_cfg.speculative.draft_model,
                         )
 
+                    # Check for --mmproj in extra_args and pre-download it
+                    for idx in range(len(rt_cfg.extra_args)):
+                        arg = rt_cfg.extra_args[idx]
+                        mmproj_filename = None
+                        if arg == "--mmproj" and idx + 1 < len(rt_cfg.extra_args):
+                            mmproj_filename = rt_cfg.extra_args[idx + 1]
+                        elif arg.startswith("--mmproj="):
+                            parts = arg.split("=", 1)
+                            if len(parts) > 1:
+                                mmproj_filename = parts[1]
+
+                        if mmproj_filename is not None:
+                            mmproj_source = ModelSource(
+                                repo_id=rt_cfg.source.repo_id,
+                                filename=mmproj_filename,
+                                revision=rt_cfg.source.revision,
+                            )
+                            await asyncio.to_thread(
+                                self._hf.resolve_source, mmproj_source
+                            )
+
                     self._active_runtime.model_path = (
                         Path(model_path).resolve().absolute()
                     )
@@ -788,6 +809,17 @@ class ModelRuntimeManager:
                                 if key_part.startswith("--")
                                 else key_part[1:]
                             )
+                            if key == "mmproj":
+                                mmproj_source = ModelSource(
+                                    repo_id=rt_cfg.source.repo_id,
+                                    filename=val,
+                                    revision=rt_cfg.source.revision,
+                                )
+                                resolved_mmproj = self._find_cached_path(mmproj_source)
+                                if resolved_mmproj is not None:
+                                    val = self._map_model_path_sync(
+                                        mmproj_source, resolved_mmproj
+                                    )
                             lines.append(f"{key} = {val}")
                             i += 1
                         else:
@@ -796,6 +828,19 @@ class ModelRuntimeManager:
                                 i + 1
                             ].startswith("-"):
                                 val = rt_cfg.extra_args[i + 1]
+                                if key == "mmproj":
+                                    mmproj_source = ModelSource(
+                                        repo_id=rt_cfg.source.repo_id,
+                                        filename=val,
+                                        revision=rt_cfg.source.revision,
+                                    )
+                                    resolved_mmproj = self._find_cached_path(
+                                        mmproj_source
+                                    )
+                                    if resolved_mmproj is not None:
+                                        val = self._map_model_path_sync(
+                                            mmproj_source, resolved_mmproj
+                                        )
                                 lines.append(f"{key} = {val}")
                                 i += 2
                             else:

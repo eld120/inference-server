@@ -691,3 +691,78 @@ async def test_runtime_timeout_error(tmp_path: Path, monkeypatch: pytest.MonkeyP
     with pytest.raises(TimeoutError, match="runtime did not become ready in time"):
         await manager.load("gemma", "rocm")
 
+
+@pytest.mark.asyncio
+async def test_mmproj_download_and_ini_mapping(monkeypatch, tmp_path: Path) -> None:
+    from schemas import HFCachedFile
+
+    # Setup mock file structure in cache
+    repo_dir = tmp_path / "hub" / "models--org--model"
+    snapshots = repo_dir / "snapshots" / "main"
+    snapshots.mkdir(parents=True)
+    
+    model_file = snapshots / "model.gguf"
+    model_file.write_text("model")
+    
+    mmproj_file = snapshots / "mmproj-BF16.gguf"
+    mmproj_file.write_text("mmproj")
+
+    class MockCachedHF(FakeHF):
+        def cache_files(self) -> list[HFCachedFile]:
+            return [
+                HFCachedFile(
+                    repo_id="org/model",
+                    revision="main",
+                    refs=["main"],
+                    filename="model.gguf",
+                    local_path=str(model_file),
+                ),
+                HFCachedFile(
+                    repo_id="org/model",
+                    revision="main",
+                    refs=["main"],
+                    filename="mmproj-BF16.gguf",
+                    local_path=str(mmproj_file),
+                ),
+            ]
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="m_vision",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        source=ModelSource(
+                            repo_id="org/model", filename="model.gguf", revision="main"
+                        ),
+                        extra_args=["--mmproj", "mmproj-BF16.gguf"],
+                    )
+                },
+            )
+        ]
+    )
+
+    upstream_app = MockUpstreamApp()
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=MockCachedHF(tmp_path / "hub"),
+        proxy_client_factory=lambda base_url: mock_client_factory(
+            base_url, upstream_app
+        ),
+    )
+    manager._docker_client = MockDockerClient()
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    await manager.load("m_vision", "rocm")
+
+    # Verify that the generated INI config maps the mmproj to its container path
+    ini_content = await manager._generate_presets_ini("rocm")
+    assert "mmproj = /huggingface/models--org--model/snapshots/main/mmproj-BF16.gguf" in ini_content
+
