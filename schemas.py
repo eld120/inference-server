@@ -3,7 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator, PrivateAttr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 SpeculativeType = Literal[
     "none",
@@ -103,37 +110,116 @@ class RuntimeConfig(BaseModel):
         return self
 
 
+class BackendConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    docker_image: str
+    devices: list[str] = Field(default_factory=list)
+    volumes: dict[str, str] = Field(default_factory=dict)
+    shared_args: list[str] = Field(default_factory=list)
+    bind_host: str = "127.0.0.1"
+    connect_host: str = "127.0.0.1"
+
+
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    runtimes: dict[Literal["rocm", "vulkan"], RuntimeConfig]
+    source: ModelSource | None = None
+    extra_args: list[str] = Field(default_factory=list)
+    speculative: SpeculativeConfig = Field(default_factory=SpeculativeConfig)
+    runtimes: dict[Literal["rocm", "vulkan"], RuntimeConfig] = Field(
+        default_factory=dict
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_shape_exclusivity(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            runtimes = data.get("runtimes")
+            if runtimes:  # runtimes is present and non-empty
+                forbidden = [
+                    f for f in ("source", "extra_args", "speculative") if f in data
+                ]
+                if forbidden:
+                    name = data.get("name", "unnamed")
+                    raise ValueError(
+                        f"model '{name}' cannot mix legacy and new shared-backend shapes: "
+                        f"found 'runtimes' alongside top-level field(s) {', '.join(sorted(forbidden))}"
+                    )
+        return data
 
     @model_validator(mode="after")
     def _validate_runtimes(self) -> ModelConfig:
-        if not self.runtimes:
-            raise ValueError("model must have at least one runtime configured")
+        for arg in self.extra_args:
+            if arg == "--spec-type" or arg.startswith("--spec-type="):
+                raise ValueError(
+                    "do not specify '--spec-type' in extra_args; "
+                    "use the structured 'speculative' configuration field instead"
+                )
 
-        for rt_name, rt_cfg in self.runtimes.items():
-            src = rt_cfg.source
-            if src.local_path is None:
-                if src.repo_id is None or src.filename is None:
-                    raise ValueError(
-                        f"model '{self.name}' runtime '{rt_name}': "
-                        "model source must specify local_path, "
-                        "or both repo_id and filename"
-                    )
-
-            if rt_cfg.speculative.draft_model is not None:
-                dm = rt_cfg.speculative.draft_model
-                if dm.local_path is None:
-                    if dm.repo_id is None or dm.filename is None:
+        if self.runtimes:
+            for rt_name, rt_cfg in self.runtimes.items():
+                src = rt_cfg.source
+                if src.local_path is None:
+                    if src.repo_id is None or src.filename is None:
                         raise ValueError(
                             f"model '{self.name}' runtime '{rt_name}': "
-                            "draft_model source must specify local_path, "
+                            "model source must specify local_path, "
                             "or both repo_id and filename"
                         )
+
+                if rt_cfg.speculative.draft_model is not None:
+                    dm = rt_cfg.speculative.draft_model
+                    if dm.local_path is None:
+                        if dm.repo_id is None or dm.filename is None:
+                            raise ValueError(
+                                f"model '{self.name}' runtime '{rt_name}': "
+                                "draft_model source must specify local_path, "
+                                "or both repo_id and filename"
+                            )
+            return self
+
+        if self.source is None:
+            raise ValueError(
+                "model must define either top-level source/backends usage "
+                "or at least one runtime configured"
+            )
+
+        if self.source.local_path is None:
+            if self.source.repo_id is None or self.source.filename is None:
+                raise ValueError(
+                    f"model '{self.name}': model source must specify local_path, "
+                    "or both repo_id and filename"
+                )
+
+        if self.speculative.draft_model is not None:
+            dm = self.speculative.draft_model
+            if dm.local_path is None:
+                if dm.repo_id is None or dm.filename is None:
+                    raise ValueError(
+                        f"model '{self.name}': draft_model source must specify "
+                        "local_path, or both repo_id and filename"
+                    )
         return self
+
+    def source_for_runtime(self, runtime: str | None = None) -> ModelSource | None:
+        if runtime is not None and runtime in self.runtimes:
+            return self.runtimes[runtime].source
+        if self.source is not None:
+            return self.source
+        if self.runtimes:
+            return next(iter(self.runtimes.values())).source
+        return None
+
+    def speculative_for_runtime(self, runtime: str | None = None) -> SpeculativeConfig:
+        if runtime is not None and runtime in self.runtimes:
+            return self.runtimes[runtime].speculative
+        if self.source is not None:
+            return self.speculative
+        if self.runtimes:
+            return next(iter(self.runtimes.values())).speculative
+        return SpeculativeConfig()
 
 
 class HealthResponse(BaseModel):
@@ -208,23 +294,12 @@ class ModelResource(BaseModel):
 
     @property
     def model(self) -> str:
-        active_rt = self.status.active_runtime
-        if active_rt and active_rt in self.config.runtimes:
-            return self.config.runtimes[active_rt].source.label()
-        if self.config.runtimes:
-            first_rt = list(self.config.runtimes.keys())[0]
-            return self.config.runtimes[first_rt].source.label()
-        return "unconfigured"
+        source = self.config.source_for_runtime(self.status.active_runtime)
+        return source.label() if source is not None else "unconfigured"
 
     @property
     def speculative_type(self) -> SpeculativeType:
-        active_rt = self.status.active_runtime
-        if active_rt and active_rt in self.config.runtimes:
-            return self.config.runtimes[active_rt].speculative.type
-        if self.config.runtimes:
-            first_rt = list(self.config.runtimes.keys())[0]
-            return self.config.runtimes[first_rt].speculative.type
-        return "none"
+        return self.config.speculative_for_runtime(self.status.active_runtime).type
 
 
 class ModelsResponse(BaseModel):
@@ -236,6 +311,9 @@ class ModelsResponse(BaseModel):
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    backends: dict[Literal["rocm", "vulkan"], BackendConfig] = Field(
+        default_factory=dict
+    )
     models: list[ModelConfig] = Field(default_factory=list)
     hf_cache_dir: Path = Field(
         default_factory=lambda: Path.home() / ".cache" / "huggingface" / "hub"
@@ -258,6 +336,13 @@ class AppConfig(BaseModel):
             if name in seen:
                 errors.append(f"duplicate model name: '{name}'")
             seen.add(name)
+
+        if self.models and not self.backends:
+            if any(not model.runtimes for model in self.models):
+                errors.append(
+                    "top-level backends must be configured when models "
+                    "use shared backend mapping"
+                )
 
         if errors:
             msg = "invalid configuration:\n  - " + "\n  - ".join(errors)

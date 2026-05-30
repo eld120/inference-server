@@ -41,6 +41,21 @@ def load_app_config(path: Path) -> AppConfig:
 
     config_dir = path.parent.resolve().absolute()
     for m in config.models:
+        if m.source is not None and m.source.local_path is not None:
+            lp = m.source.local_path
+            if not lp.is_absolute():
+                m.source._original_local_path_is_relative = True
+                m.source.local_path = (config_dir / lp).resolve().absolute()
+            else:
+                m.source.local_path = lp.resolve().absolute()
+        if m.speculative.draft_model is not None and m.speculative.draft_model.local_path is not None:
+            lp = m.speculative.draft_model.local_path
+            if not lp.is_absolute():
+                m.speculative.draft_model._original_local_path_is_relative = True
+                m.speculative.draft_model.local_path = (config_dir / lp).resolve().absolute()
+            else:
+                m.speculative.draft_model.local_path = lp.resolve().absolute()
+
         for rt in m.runtimes.values():
             if rt.source.local_path is not None:
                 lp = rt.source.local_path
@@ -69,8 +84,25 @@ def save_app_config(path: Path, config: AppConfig) -> None:
     config_copy = config.model_copy(deep=True)
     config_dir = path.parent.resolve().absolute()
     for m_idx, m in enumerate(config_copy.models):
+        orig_model = config.models[m_idx]
+        if m.source is not None and m.source.local_path is not None:
+            is_rel = getattr(orig_model.source, "_original_local_path_is_relative", False)
+            if is_rel:
+                lp = m.source.local_path.resolve().absolute()
+                import os
+                m.source.local_path = Path(os.path.relpath(lp, config_dir))
+        if m.speculative.draft_model is not None and m.speculative.draft_model.local_path is not None:
+            is_rel = getattr(
+                orig_model.speculative.draft_model,
+                "_original_local_path_is_relative",
+                False,
+            )
+            if is_rel:
+                lp = m.speculative.draft_model.local_path.resolve().absolute()
+                import os
+                m.speculative.draft_model.local_path = Path(os.path.relpath(lp, config_dir))
         for rt_name, rt in m.runtimes.items():
-            orig_rt = config.models[m_idx].runtimes[rt_name]
+            orig_rt = orig_model.runtimes[rt_name]
             if rt.source.local_path is not None:
                 is_rel = getattr(orig_rt.source, "_original_local_path_is_relative", False)
                 if is_rel:
@@ -92,7 +124,7 @@ def save_app_config(path: Path, config: AppConfig) -> None:
                     rt.speculative.draft_model.local_path = Path(
                         os.path.relpath(lp, config_dir)
                     )
-    path.write_text(config_copy.model_dump_json(indent=2))
+    path.write_text(config_copy.model_dump_json(indent=2, exclude_unset=True))
 
 
 def effective_hf_token(runtime: RuntimeSettings, app_config: AppConfig) -> str | None:

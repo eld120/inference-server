@@ -1,199 +1,111 @@
 {
   "api_prefix": "/api",
   "hf_cache_dir": "~/.cache/huggingface/hub",
+  "backends": {
+    "rocm": {
+      "docker_image": "inference-server-llama-rocm:7.2.1-7e50ef7",
+      "devices": [
+        "/dev/kfd",
+        "/dev/dri"
+      ],
+      "shared_args": [
+        "-ngl",
+        "99",
+        "-c",
+        "96000",
+        "-fa",
+        "on",
+        "-np",
+        "1",
+        "--no-mmap",
+        "--cache-prompt",
+        "--cache-type-k",
+        "q8_0",
+        "--cache-type-v",
+        "q8_0"
+      ]
+    },
+    "vulkan": {
+      "docker_image": "inference-server-llama-vulkan:26.04-7e50ef7",
+      "devices": [
+        "/dev/dri"
+      ],
+      "shared_args": [
+        "-ngl",
+        "99",
+        "-c",
+        "96000",
+        "-fa",
+        "on",
+        "-np",
+        "1",
+        "--no-mmap",
+        "--cache-prompt",
+        "--cache-type-k",
+        "q8_0",
+        "--cache-type-v",
+        "q8_0"
+      ]
+    }
+  },
   "models": [
     {
       "name": "qwen3.6-27b-mtp-example",
-      "runtimes": {
-        "rocm": {
-          "source": {
-            "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
-            "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-            "revision": "main"
-          },
-          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
-          "devices": [
-            "/dev/kfd",
-            "/dev/dri"
-          ],
-          "shared_args": [
-            "-ngl",
-            "99",
-            "-c",
-            "96000",
-            "-fa",
-            "on",
-            "-np",
-            "1",
-            "--no-mmap",
-            "--cache-prompt",
-            "--cache-type-k",
-            "q8_0",
-            "--cache-type-v",
-            "q8_0"
-          ],
-          "extra_args": [
-            "--spec-draft-n-max",
-            "2"
-          ],
-          "speculative": {
-            "type": "draft-mtp"
-          }
-        },
-        "vulkan": {
-          "source": {
-            "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
-            "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-            "revision": "main"
-          },
-          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-vulkan",
-          "devices": [
-            "/dev/dri"
-          ],
-          "shared_args": [
-            "-ngl",
-            "99",
-            "-c",
-            "96000",
-            "-fa",
-            "on",
-            "-np",
-            "1",
-            "--no-mmap",
-            "--cache-prompt",
-            "--cache-type-k",
-            "q8_0",
-            "--cache-type-v",
-            "q8_0"
-          ],
-          "extra_args": [
-            "--spec-draft-n-max",
-            "2"
-          ],
-          "speculative": {
-            "type": "draft-mtp"
-          }
-        }
+      "source": {
+        "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
+        "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
+        "revision": "main"
+      },
+      "extra_args": [
+        "--spec-draft-n-max",
+        "2"
+      ],
+      "speculative": {
+        "type": "draft-mtp"
       }
     },
     {
       "name": "qwen3.6-27b-vision-example",
-      "runtimes": {
-        "rocm": {
-          "source": {
-            "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
-            "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-            "revision": "main"
-          },
-          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
-          "devices": [
-            "/dev/kfd",
-            "/dev/dri"
-          ],
-          "shared_args": [
-            "-ngl",
-            "99",
-            "-c",
-            "96000",
-            "-fa",
-            "on",
-            "-np",
-            "1",
-            "--no-mmap",
-            "--cache-prompt",
-            "--cache-type-k",
-            "q8_0",
-            "--cache-type-v",
-            "q8_0"
-          ],
-          "extra_args": [
-            "--mmproj",
-            "mmproj-BF16.gguf"
-          ]
-        }
-      }
+      "source": {
+        "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
+        "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
+        "revision": "main"
+      },
+      "extra_args": [
+        "--mmproj",
+        "mmproj-BF16.gguf"
+      ]
     },
     {
       "name": "qwen3.6-27b-vision-mtp-example",
-      "runtimes": {
-        "rocm": {
-          "source": {
-            "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
-            "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-            "revision": "main"
-          },
-          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
-          "devices": [
-            "/dev/kfd",
-            "/dev/dri"
-          ],
-          "shared_args": [
-            "-ngl",
-            "99",
-            "-c",
-            "96000",
-            "-fa",
-            "on",
-            "-np",
-            "1",
-            "--no-mmap",
-            "--cache-prompt",
-            "--cache-type-k",
-            "q8_0",
-            "--cache-type-v",
-            "q8_0"
-          ],
-          "extra_args": [
-            "--mmproj",
-            "mmproj-BF16.gguf",
-            "--spec-draft-n-max",
-            "2"
-          ],
-          "speculative": {
-            "type": "draft-mtp"
-          }
-        }
+      "source": {
+        "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
+        "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
+        "revision": "main"
+      },
+      "extra_args": [
+        "--mmproj",
+        "mmproj-BF16.gguf",
+        "--spec-draft-n-max",
+        "2"
+      ],
+      "speculative": {
+        "type": "draft-mtp"
       }
     },
     {
       "name": "gemma-4-31b-speculative-example",
-      "runtimes": {
-        "rocm": {
-          "source": {
-            "repo_id": "unsloth/gemma-4-31B-it-GGUF",
-            "filename": "gemma-4-31B-it-UD-Q4_K_XL.gguf",
-            "revision": "main"
-          },
-          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
-          "devices": [
-            "/dev/kfd",
-            "/dev/dri"
-          ],
-          "shared_args": [
-            "-ngl",
-            "99",
-            "-c",
-            "96000",
-            "-fa",
-            "on",
-            "-np",
-            "1",
-            "--no-mmap",
-            "--cache-prompt",
-            "--cache-type-k",
-            "q8_0",
-            "--cache-type-v",
-            "q8_0"
-          ],
-          "extra_args": [],
-          "speculative": {
-            "type": "draft",
-            "draft_model": {
-              "repo_id": "google/gemma-4-31B-it-assistant",
-              "filename": "gemma-4-31b-it-assistant-Q4_K_M.gguf",
-              "revision": "main"
-            }
-          }
+      "source": {
+        "repo_id": "unsloth/gemma-4-31B-it-GGUF",
+        "filename": "gemma-4-31B-it-UD-Q4_K_XL.gguf",
+        "revision": "main"
+      },
+      "speculative": {
+        "type": "draft",
+        "draft_model": {
+          "repo_id": "google/gemma-4-31B-it-assistant",
+          "filename": "gemma-4-31b-it-assistant-Q4_K_M.gguf",
+          "revision": "main"
         }
       }
     }

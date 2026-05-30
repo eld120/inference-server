@@ -22,6 +22,7 @@ from protocols import (
 )
 from schemas import (
     AppConfig,
+    BackendConfig,
     RuntimeState,
     ModelConfig,
     ModelResource,
@@ -122,37 +123,39 @@ class RuntimeContainer:
             }
 
             for m in self.manager._config.models:
-                if self.runtime_type in m.runtimes:
-                    rt_cfg = m.runtimes[self.runtime_type]
-                    if rt_cfg.source.local_path is not None:
-                        local_p = Path(rt_cfg.source.local_path).resolve().absolute()
-                        cache_dir = self.manager._hf.cache_dir.resolve().absolute()
-                        if not local_p.is_relative_to(cache_dir):
-                            parent = local_p.parent
-                            suffix = self.manager._dir_hash(parent)
-                            bind_path = f"/local_models_{suffix}"
-                            volumes[str(parent)] = {
-                                "bind": bind_path,
-                                "mode": "ro",
-                            }
-                    if (
-                        rt_cfg.speculative.draft_model is not None
-                        and rt_cfg.speculative.draft_model.local_path is not None
-                    ):
-                        local_p = (
-                            Path(rt_cfg.speculative.draft_model.local_path)
-                            .resolve()
-                            .absolute()
-                        )
-                        cache_dir = self.manager._hf.cache_dir.resolve().absolute()
-                        if not local_p.is_relative_to(cache_dir):
-                            parent = local_p.parent
-                            suffix = self.manager._dir_hash(parent)
-                            bind_path = f"/local_models_{suffix}"
-                            volumes[str(parent)] = {
-                                "bind": bind_path,
-                                "mode": "ro",
-                            }
+                try:
+                    rt_cfg = self.manager._resolve_runtime_config(m, self.runtime_type)
+                except ValueError:
+                    continue
+                if rt_cfg.source.local_path is not None:
+                    local_p = Path(rt_cfg.source.local_path).resolve().absolute()
+                    cache_dir = self.manager._hf.cache_dir.resolve().absolute()
+                    if not local_p.is_relative_to(cache_dir):
+                        parent = local_p.parent
+                        suffix = self.manager._dir_hash(parent)
+                        bind_path = f"/local_models_{suffix}"
+                        volumes[str(parent)] = {
+                            "bind": bind_path,
+                            "mode": "ro",
+                        }
+                if (
+                    rt_cfg.speculative.draft_model is not None
+                    and rt_cfg.speculative.draft_model.local_path is not None
+                ):
+                    local_p = (
+                        Path(rt_cfg.speculative.draft_model.local_path)
+                        .resolve()
+                        .absolute()
+                    )
+                    cache_dir = self.manager._hf.cache_dir.resolve().absolute()
+                    if not local_p.is_relative_to(cache_dir):
+                        parent = local_p.parent
+                        suffix = self.manager._dir_hash(parent)
+                        bind_path = f"/local_models_{suffix}"
+                        volumes[str(parent)] = {
+                            "bind": bind_path,
+                            "mode": "ro",
+                        }
 
             # Apply runtime specific custom mounts
             for src, dst in self.volumes.items():
@@ -301,13 +304,21 @@ class ProxySession:
 
 
 class ActiveModel:
-    def __init__(self, name: str, model_config: ModelConfig, runtime: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        model_config: ModelConfig,
+        runtime: str,
+        manager: ModelRuntimeManager,
+    ) -> None:
+        self.name = name
         self.model_config = model_config
         self.runtime = runtime
+        self.manager = manager
 
     @property
     def config(self):
-        rt_cfg = self.model_config.runtimes[self.runtime]
+        rt_cfg = self.manager._resolve_runtime_config(self.model_config, self.runtime)
         return SimpleNamespace(
             name=self.model_config.name,
             model=rt_cfg.source,
@@ -405,24 +416,27 @@ class ModelRuntimeManager:
                         )
 
         active_rt = active_runtime if active else None
-        first_rt_name = list(model_config.runtimes.keys())[0]
-        rt_cfg = model_config.runtimes[first_rt_name]
-        if active_rt and active_rt in model_config.runtimes:
-            rt_cfg = model_config.runtimes[active_rt]
+        first_rt_name = self._first_runtime_name_for_model(model_config)
+        rt_cfg: RuntimeConfig | None = None
+        if first_rt_name is not None:
+            rt_cfg = self._resolve_runtime_config(model_config, first_rt_name)
+        if active_rt is not None:
+            rt_cfg = self._resolve_runtime_config(model_config, active_rt)
 
-        # Get model label:
         model_label = "unconfigured"
-        if active_rt and active_rt in model_config.runtimes:
-            model_label = model_config.runtimes[active_rt].source.label()
-        elif model_config.runtimes:
-            model_label = model_config.runtimes[first_rt_name].source.label()
-
-        # Get speculative type:
         spec_type = "none"
-        if active_rt and active_rt in model_config.runtimes:
-            spec_type = model_config.runtimes[active_rt].speculative.type
-        elif model_config.runtimes:
-            spec_type = model_config.runtimes[first_rt_name].speculative.type
+        if rt_cfg is not None:
+            model_label = rt_cfg.source.label()
+            spec_type = rt_cfg.speculative.type
+        elif model_config.source is not None:
+            model_label = model_config.source.label()
+            spec_type = model_config.speculative.type
+
+        host = "127.0.0.1"
+        base_url = f"http://127.0.0.1:{self.runtime_port}"
+        if rt_cfg is not None:
+            host = rt_cfg.connect_host
+            base_url = f"http://{rt_cfg.connect_host}:{self.runtime_port}"
 
         return ModelStatus(
             name=model_config.name,
@@ -431,13 +445,13 @@ class ModelRuntimeManager:
             active_runtime=active_rt,
             model=model_label,
             speculative_type=spec_type,
-            host=rt_cfg.connect_host,
+            host=host,
             port=self.runtime_port,
             container_id=container_id,
             last_error=last_error,
             model_path=model_path,
             draft_model_path=draft_model_path,
-            base_url=f"http://{rt_cfg.connect_host}:{self.runtime_port}",
+            base_url=base_url,
         )
 
     def _to_resource(self, model_config: ModelConfig) -> ModelResource:
@@ -484,24 +498,73 @@ class ModelRuntimeManager:
         msg = f"unknown model: {name}"
         raise KeyError(msg)
 
+    def _resolve_runtime_config(
+        self,
+        model_config: ModelConfig,
+        runtime: str,
+    ) -> RuntimeConfig:
+        if model_config.runtimes:
+            if runtime not in model_config.runtimes:
+                raise ValueError(
+                    f"model '{model_config.name}' does not support runtime '{runtime}'"
+                )
+            return model_config.runtimes[runtime]
+
+        if runtime not in self._config.backends:
+            raise ValueError(
+                f"runtime '{runtime}' is not configured in top-level backends"
+            )
+        if model_config.source is None:
+            raise ValueError(f"model '{model_config.name}' has no configured source")
+
+        backend_cfg: BackendConfig = self._config.backends[runtime]
+        return RuntimeConfig(
+            source=model_config.source,
+            docker_image=backend_cfg.docker_image,
+            devices=backend_cfg.devices,
+            volumes=backend_cfg.volumes,
+            shared_args=backend_cfg.shared_args,
+            extra_args=model_config.extra_args,
+            speculative=model_config.speculative,
+            bind_host=backend_cfg.bind_host,
+            connect_host=backend_cfg.connect_host,
+        )
+
+    def _first_runtime_name_for_model(self, model_config: ModelConfig) -> str | None:
+        if model_config.runtimes:
+            return next(iter(model_config.runtimes))
+        if self._config.backends:
+            return next(iter(self._config.backends))
+        return None
+
+    @staticmethod
+    def _runtime_is_reusable(
+        active_runtime: RuntimeContainer | None,
+        runtime: str,
+        rt_cfg: RuntimeConfig,
+    ) -> bool:
+        return (
+            active_runtime is not None
+            and active_runtime.state == "running"
+            and active_runtime.container is not None
+            and active_runtime.runtime_type == runtime
+            and active_runtime.docker_image == rt_cfg.docker_image
+            and active_runtime.devices == rt_cfg.devices
+            and active_runtime.volumes == rt_cfg.volumes
+            and active_runtime.bind_host == rt_cfg.bind_host
+            and active_runtime.connect_host == rt_cfg.connect_host
+            and active_runtime.shared_args == rt_cfg.shared_args
+        )
+
     async def load(self, name: str, runtime: str) -> ModelResource:
         async with self._lock:
             # 1. Resolve target model config
             model_cfg = self._get_model_config(name)
-            if runtime not in model_cfg.runtimes:
-                raise ValueError(f"model '{name}' does not support runtime '{runtime}'")
-            rt_cfg = model_cfg.runtimes[runtime]
+            rt_cfg = self._resolve_runtime_config(model_cfg, runtime)
 
             # 2. Check if running container is already active and compatible
-            is_compatible = (
-                self._active_runtime is not None
-                and self._active_runtime.runtime_type == runtime
-                and self._active_runtime.docker_image == rt_cfg.docker_image
-                and self._active_runtime.devices == rt_cfg.devices
-                and self._active_runtime.volumes == rt_cfg.volumes
-                and self._active_runtime.bind_host == rt_cfg.bind_host
-                and self._active_runtime.connect_host == rt_cfg.connect_host
-                and self._active_runtime.shared_args == rt_cfg.shared_args
+            is_compatible = self._runtime_is_reusable(
+                self._active_runtime, runtime, rt_cfg
             )
 
             if is_compatible and self._active_runtime is not None:
@@ -760,55 +823,74 @@ class ModelRuntimeManager:
         lines = []
 
         for m in self._config.models:
-            if runtime_type in m.runtimes:
-                rt_cfg = m.runtimes[runtime_type]
-                resolved_model_path = None
-                resolved_draft_path = None
+            try:
+                rt_cfg = self._resolve_runtime_config(m, runtime_type)
+            except ValueError:
+                continue
 
-                if m.name == active_model_name:
-                    resolved_model_path = active_model_resolved_path
-                    resolved_draft_path = active_model_draft_resolved_path
-                else:
-                    resolved_model_path = self._find_cached_path(rt_cfg.source)
-                    if rt_cfg.speculative.draft_model is not None:
-                        resolved_draft_path = self._find_cached_path(
-                            rt_cfg.speculative.draft_model
+            resolved_model_path = None
+            resolved_draft_path = None
+
+            if m.name == active_model_name:
+                resolved_model_path = active_model_resolved_path
+                resolved_draft_path = active_model_draft_resolved_path
+            else:
+                resolved_model_path = self._find_cached_path(rt_cfg.source)
+                if rt_cfg.speculative.draft_model is not None:
+                    resolved_draft_path = self._find_cached_path(
+                        rt_cfg.speculative.draft_model
+                    )
+
+            if resolved_model_path is None:
+                continue
+
+            lines.append(f"[{m.name}]")
+            container_path = self._map_model_path_sync(
+                rt_cfg.source, resolved_model_path
+            )
+            lines.append(f"model = {container_path}")
+
+            if rt_cfg.speculative.type != "none":
+                lines.append(f"spec-type = {rt_cfg.speculative.type}")
+                if (
+                    rt_cfg.speculative.draft_model is not None
+                    and resolved_draft_path is not None
+                ):
+                    draft_p = self._map_model_path_sync(
+                        rt_cfg.speculative.draft_model, resolved_draft_path
+                    )
+                    lines.append(f"model-draft = {draft_p}")
+
+            i = 0
+            while i < len(rt_cfg.extra_args):
+                arg = rt_cfg.extra_args[i]
+                if arg.startswith("-") and len(arg) > 1:
+                    if "=" in arg:
+                        parts = arg.split("=", 1)
+                        key_part = parts[0]
+                        val = parts[1]
+                        key = (
+                            key_part[2:] if key_part.startswith("--") else key_part[1:]
                         )
-
-                if resolved_model_path is None:
-                    continue
-
-                lines.append(f"[{m.name}]")
-                container_path = self._map_model_path_sync(
-                    rt_cfg.source, resolved_model_path
-                )
-                lines.append(f"model = {container_path}")
-
-                if rt_cfg.speculative.type != "none":
-                    lines.append(f"spec-type = {rt_cfg.speculative.type}")
-                    if (
-                        rt_cfg.speculative.draft_model is not None
-                        and resolved_draft_path is not None
-                    ):
-                        draft_p = self._map_model_path_sync(
-                            rt_cfg.speculative.draft_model, resolved_draft_path
-                        )
-                        lines.append(f"model-draft = {draft_p}")
-
-                # Extra args mapping
-                i = 0
-                while i < len(rt_cfg.extra_args):
-                    arg = rt_cfg.extra_args[i]
-                    if arg.startswith("-") and len(arg) > 1:
-                        if "=" in arg:
-                            parts = arg.split("=", 1)
-                            key_part = parts[0]
-                            val = parts[1]
-                            key = (
-                                key_part[2:]
-                                if key_part.startswith("--")
-                                else key_part[1:]
+                        if key == "mmproj":
+                            mmproj_source = ModelSource(
+                                repo_id=rt_cfg.source.repo_id,
+                                filename=val,
+                                revision=rt_cfg.source.revision,
                             )
+                            resolved_mmproj = self._find_cached_path(mmproj_source)
+                            if resolved_mmproj is not None:
+                                val = self._map_model_path_sync(
+                                    mmproj_source, resolved_mmproj
+                                )
+                        lines.append(f"{key} = {val}")
+                        i += 1
+                    else:
+                        key = arg[2:] if arg.startswith("--") else arg[1:]
+                        if i + 1 < len(rt_cfg.extra_args) and not rt_cfg.extra_args[
+                            i + 1
+                        ].startswith("-"):
+                            val = rt_cfg.extra_args[i + 1]
                             if key == "mmproj":
                                 mmproj_source = ModelSource(
                                     repo_id=rt_cfg.source.repo_id,
@@ -821,34 +903,13 @@ class ModelRuntimeManager:
                                         mmproj_source, resolved_mmproj
                                     )
                             lines.append(f"{key} = {val}")
-                            i += 1
+                            i += 2
                         else:
-                            key = arg[2:] if arg.startswith("--") else arg[1:]
-                            if i + 1 < len(rt_cfg.extra_args) and not rt_cfg.extra_args[
-                                i + 1
-                            ].startswith("-"):
-                                val = rt_cfg.extra_args[i + 1]
-                                if key == "mmproj":
-                                    mmproj_source = ModelSource(
-                                        repo_id=rt_cfg.source.repo_id,
-                                        filename=val,
-                                        revision=rt_cfg.source.revision,
-                                    )
-                                    resolved_mmproj = self._find_cached_path(
-                                        mmproj_source
-                                    )
-                                    if resolved_mmproj is not None:
-                                        val = self._map_model_path_sync(
-                                            mmproj_source, resolved_mmproj
-                                        )
-                                lines.append(f"{key} = {val}")
-                                i += 2
-                            else:
-                                lines.append(f"{key} = true")
-                                i += 1
-                    else:
-                        i += 1
-                lines.append("")
+                            lines.append(f"{key} = true")
+                            i += 1
+                else:
+                    i += 1
+            lines.append("")
         return "\n".join(lines)
 
     def create_proxy_client(self, base_url: str) -> httpx.AsyncClient:
@@ -882,7 +943,10 @@ class ModelRuntimeManager:
             return None
         model_cfg = self._get_model_config(self._active_model_name)
         return ActiveModel(
-            self._active_model_name, model_cfg, self._active_runtime.runtime_type
+            self._active_model_name,
+            model_cfg,
+            self._active_runtime.runtime_type,
+            self,
         )
 
     async def get_logs(self, name: str) -> list[str]:
