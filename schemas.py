@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator, PrivateAttr
 
 SpeculativeType = Literal[
     "none",
@@ -26,6 +26,15 @@ class ModelSource(BaseModel):
     filename: str | None = None
     local_path: Path | None = None
     revision: str = "main"
+
+    _original_local_path_is_relative: bool = PrivateAttr(default=False)
+
+    @field_validator("local_path", mode="after")
+    @classmethod
+    def _validate_local_path(cls, v: Path | None) -> Path | None:
+        if v is not None:
+            return v.expanduser()
+        return v
 
     def is_local(self) -> bool:
         return self.local_path is not None
@@ -82,6 +91,16 @@ class RuntimeConfig(BaseModel):
     speculative: SpeculativeConfig = Field(default_factory=SpeculativeConfig)
     bind_host: str = "127.0.0.1"
     connect_host: str = "127.0.0.1"
+
+    @model_validator(mode="after")
+    def _validate_speculative_args(self) -> RuntimeConfig:
+        for arg in self.extra_args:
+            if arg == "--spec-type" or arg.startswith("--spec-type="):
+                raise ValueError(
+                    "do not specify '--spec-type' in extra_args; "
+                    "use the structured 'speculative' configuration field instead"
+                )
+        return self
 
 
 class ModelConfig(BaseModel):
@@ -223,6 +242,11 @@ class AppConfig(BaseModel):
     )
     hf_token: str | None = None
     api_prefix: str = "/api"
+
+    @field_validator("hf_cache_dir", mode="after")
+    @classmethod
+    def _validate_hf_cache_dir(cls, v: Path) -> Path:
+        return v.expanduser().resolve()
 
     @model_validator(mode="after")
     def _validate_config(self) -> AppConfig:
