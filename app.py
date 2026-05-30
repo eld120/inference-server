@@ -283,6 +283,13 @@ def create_app(
                         detail=f"Requested model '{model_name}' is not configured.",
                     )
 
+                target_status = manager.model_resource(target_model).status
+                if target_status.state in {"pulling", "starting"}:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Model '{target_model}' is still loading.",
+                    )
+
                 # Verify configured model matches currently loaded model
                 if active is None or active.config.name != target_model:
                     raise HTTPException(
@@ -294,6 +301,16 @@ def create_app(
                     )
             else:
                 # No model specified: check if any model is loaded
+                starting_models = [
+                    status.name
+                    for status in manager.model_statuses()
+                    if status.state in {"pulling", "starting"} and status.name is not None
+                ]
+                if starting_models:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Model '{starting_models[0]}' is still loading.",
+                    )
                 if active is None:
                     raise HTTPException(
                         status_code=400,

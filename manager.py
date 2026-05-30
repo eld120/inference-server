@@ -8,12 +8,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-import docker
 import docker.errors
 import docker.models.containers
 import httpx
 import huggingface_hub
 
+import docker
 from config import RuntimeSettings
 from protocols import (
     ActiveModelProtocol,
@@ -23,12 +23,12 @@ from protocols import (
 from schemas import (
     AppConfig,
     BackendConfig,
-    RuntimeState,
     ModelConfig,
     ModelResource,
     ModelSource,
     ModelStatus,
     RuntimeConfig,
+    RuntimeState,
     ServiceStatus,
     SpeculativeConfig,
 )
@@ -231,6 +231,7 @@ class RuntimeContainer:
                 raise RuntimeError(
                     f"Failed to load model inside runtime container: {response.text}"
                 )
+        await self._wait_until_model_loaded(name)
 
     async def unload_model(self, name: str) -> None:
         async with self.manager.create_proxy_client(self.base_url) as client:
@@ -295,6 +296,141 @@ class RuntimeContainer:
         if last_error is not None:
             raise TimeoutError(msg) from last_error
         raise TimeoutError(msg)
+
+    async def _wait_until_model_loaded(self, name: str) -> None:
+        timeout_seconds = self.manager._runtime.model_load_timeout_seconds
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            container = self.container
+            if container is None:
+                raise RuntimeError(
+                    f"Runtime container disappeared while loading model '{name}'."
+                )
+
+            try:
+                await asyncio.to_thread(container.reload)
+                status = container.status
+            except Exception:
+                status = "exited"
+
+            if status == "exited":
+                try:
+                    logs_bytes = await asyncio.to_thread(container.logs, tail=100)
+                    last_logs = logs_bytes.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    last_logs = ""
+                msg = f"Runtime container exited while loading model '{name}'."
+                if last_logs:
+                    msg += f"\nLast logs:\n{last_logs}"
+                raise RuntimeError(msg)
+
+            worker_state = await self._inspect_worker_process_state()
+            if worker_state == "defunct":
+                try:
+                    logs_bytes = await asyncio.to_thread(container.logs, tail=100)
+                    last_logs = logs_bytes.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    last_logs = ""
+                msg = f"Model worker for '{name}' died during load."
+                if last_logs:
+                    msg += f"\nLast logs:\n{last_logs}"
+                raise RuntimeError(msg)
+            if worker_state in {"running", "unknown"} and await self._probe_model_readiness(
+                name
+            ):
+                return
+
+            await asyncio.sleep(1)
+
+        raise TimeoutError(
+            f"model '{name}' did not finish loading within {timeout_seconds} seconds"
+        )
+
+    async def _probe_model_readiness(self, name: str) -> bool:
+        try:
+            async with self.manager.create_proxy_client(self.base_url) as client:
+                response = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": name,
+                        "messages": [{"role": "user", "content": "."}],
+                        "max_tokens": 1,
+                        "temperature": 0,
+                        "stream": False,
+                    },
+                    timeout=self.manager._runtime.model_readiness_probe_timeout_seconds,
+                )
+        except (httpx.TimeoutException, httpx.HTTPError):
+            return False
+
+        if response.status_code != 200:
+            return False
+        return True
+
+    async def _inspect_worker_process_state(self) -> str:
+        container = self.container
+        if container is None or not hasattr(container, "exec_run"):
+            return "unknown"
+
+        try:
+            result = await asyncio.to_thread(
+                container.exec_run,
+                ["ps", "-eo", "pid=,stat=,cmd="],
+            )
+        except Exception:
+            return "unknown"
+
+        exit_code = getattr(result, "exit_code", None)
+        if exit_code is None and isinstance(result, tuple) and len(result) >= 1:
+            exit_code = result[0]
+
+        if exit_code is not None and exit_code != 0:
+            return "unknown"
+
+        output = getattr(result, "output", None)
+        if output is None and isinstance(result, tuple) and len(result) >= 2:
+            output = result[1]
+        if output is None:
+            output = b""
+
+        if isinstance(output, bytes):
+            text = output.decode("utf-8", errors="replace")
+        else:
+            text = str(output)
+
+        pid1_entry = None
+        other_entries = []
+        any_llama_server_exists = False
+
+        for line in text.splitlines():
+            stripped = line.strip()
+            if "llama-server" not in stripped:
+                continue
+            parts = stripped.split(None, 2)
+            if len(parts) < 3:
+                continue
+            pid, stat, cmd = parts
+            any_llama_server_exists = True
+
+            is_defunct = "Z" in stat or "<defunct>" in cmd
+            if pid == "1":
+                pid1_entry = (pid, stat, cmd, is_defunct)
+            else:
+                other_entries.append((pid, stat, cmd, is_defunct))
+
+        if not any_llama_server_exists:
+            return "missing"
+
+        if (pid1_entry and pid1_entry[3]) or any(entry[3] for entry in other_entries):
+            return "defunct"
+
+        if other_entries:
+            return "running"
+
+        if pid1_entry:
+            return "running"
+
+        return "missing"
 
 
 @dataclass(slots=True)
@@ -645,12 +781,32 @@ class ModelRuntimeManager:
                     await asyncio.to_thread(ini_path.write_text, ini_content)
 
                     # 5. Load the model on the runtime
+                    self._active_runtime.state = "starting"
                     await self._active_runtime.load_model(name)
+                    self._active_runtime.state = "running"
+                    self._active_runtime.last_error = None
                     self._active_model_name = name
+                except asyncio.CancelledError:
+                    self._active_runtime.state = "error"
+                    self._active_runtime.last_error = (
+                        f"Load cancelled while activating model '{name}'."
+                    )
+                    self._active_model_name = None
+                    try:
+                        await self._active_runtime.stop()
+                    except Exception:
+                        pass
+                    self._active_runtime.state = "error"
+                    raise
                 except Exception as exc:
                     self._active_runtime.state = "error"
                     self._active_runtime.last_error = str(exc)
                     self._active_model_name = None
+                    try:
+                        await self._active_runtime.stop()
+                    except Exception:
+                        pass
+                    self._active_runtime.state = "error"
                     raise
 
                 return self._to_resource(model_cfg)
@@ -693,10 +849,26 @@ class ModelRuntimeManager:
                     )
 
                 await runtime_obj.start()
+                runtime_obj.state = "starting"
                 await runtime_obj.load_model(name)
 
+                runtime_obj.state = "running"
+                runtime_obj.last_error = None
                 self._active_model_name = name
                 return self._to_resource(model_cfg)
+            except asyncio.CancelledError:
+                logger.warning("Load cancelled for model %s", name)
+                try:
+                    await runtime_obj.stop()
+                except Exception as stop_exc:
+                    logger.error(
+                        "Failed to stop runtime after cancelled load: %s", stop_exc
+                    )
+
+                runtime_obj.state = "error"
+                runtime_obj.last_error = f"Load cancelled for model '{name}'."
+                self._active_model_name = None
+                raise
             except Exception as exc:
                 logger.error(
                     "Failed to start/load runtime for model %s: %s", name, exc
@@ -922,6 +1094,12 @@ class ModelRuntimeManager:
     ) -> ProxySessionProtocol:
         if self._active_runtime is None:
             msg = "no model is loaded"
+            raise RuntimeError(msg)
+        if self._active_runtime.state != "running" or self._active_model_name is None:
+            msg = (
+                f"model '{self._active_runtime.model_name}' is still loading "
+                f"(runtime state: {self._active_runtime.state})"
+            )
             raise RuntimeError(msg)
         client = self._proxy_client_factory(self._active_runtime.base_url)
         try:

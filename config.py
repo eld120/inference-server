@@ -19,6 +19,8 @@ class RuntimeSettings(BaseSettings):
     config_path: Path = Field(default_factory=default_config_path)
     host: str = "0.0.0.0"
     port: int = 8000
+    model_load_timeout_seconds: int = 1800
+    model_readiness_probe_timeout_seconds: float = 5.0
     runtime_port: int = Field(
         default=39281,
         validation_alias=AliasChoices(
