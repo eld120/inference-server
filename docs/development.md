@@ -19,6 +19,34 @@ uv run ruff format .
 uv run ty check
 ```
 
+## Backend Images
+
+The runtime containers are built from vendored Dockerfiles in [`docker/`](../docker).
+Both recipes fetch `llama.cpp` from the pinned upstream commit
+`7e50ef7d79f7fb5f957e378111f7cf38c0929d46` during the Docker build.
+
+Build the ROCm server image:
+
+```bash
+docker build \
+  -f docker/llama-rocm.Dockerfile \
+  --target server \
+  -t inference-server-llama-rocm:7.2.1-7e50ef7 \
+  .
+```
+
+Build the Vulkan server image:
+
+```bash
+docker build \
+  -f docker/llama-vulkan.Dockerfile \
+  --target server \
+  -t inference-server-llama-vulkan:26.04-7e50ef7 \
+  .
+```
+
+Those image tags are the intended backend images for this repo. Build them first, then use the same tags in the single shared `backends` section of [config.example.json](../config.example.json).
+
 ## Notes
 
 - The `dev` dependency group contains the test and lint tooling.

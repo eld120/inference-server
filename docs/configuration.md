@@ -22,6 +22,7 @@ Top-level fields:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
+| `backends` | `object` | `{}` | Shared backend definitions keyed by `"rocm"` and/or `"vulkan"`. |
 | `api_prefix` | `string` | `"/api"` | Prefix for all server routes. |
 | `hf_cache_dir` | `string` | `~/.cache/huggingface/hub` | Local Hugging Face cache directory. |
 | `hf_token` | `string \| null` | `null` | (Discouraged) Fallback if no env token is present. Using environment variables like `HF_TOKEN` or `INF_HF_TOKEN` is strongly preferred for secret hygiene. |
@@ -31,28 +32,30 @@ Top-level fields:
 
 ## Configured Models
 
-Each model must have a unique `name` and configuration for one or more hardware runtimes.
+Each model must have a unique `name`. In the preferred format, models define only model-specific settings and the selected runtime (`"rocm"` or `"vulkan"`) maps through shared top-level backend definitions.
 
 | Field | Type | Notes |
 |---|---|---|
 | `name` | `string` | Canonical model name/key used by clients (e.g. `gemma`, `qwen`). |
-| `runtimes` | `object` | Dictionary of runtime configurations keyed by `"rocm"` and/or `"vulkan"`. |
+| `source` | `object` | Model source info (see below). |
+| `extra_args` | `string[]` | Model-specific llama.cpp arguments. |
+| `speculative` | `object` | Optional speculative decoding configuration. |
+
+Legacy compatibility:
+- `runtimes` is still accepted, but it is deprecated. It duplicates backend image and device configuration per model.
 
 ---
 
-## Runtime Configurations
+## Backend Configurations
 
-Each runtime block specifies the model source and execution details for that specific runtime environment.
+Each backend block specifies the shared container/runtime details for a hardware backend.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `source` | `object` | Required | Model source info (see below). |
-| `docker_image` | `string` | Required | Container image to run (e.g. `ghcr.io/ggerganov/llama.cpp:server-rocm`). |
+| `docker_image` | `string` | Required | Container image to run (e.g. `inference-server-llama-rocm:7.2.1-7e50ef7`). |
 | `devices` | `string[]` | `[]` | Device nodes passed through to the container. |
 | `volumes` | `object` | `{}` | Host-to-container mount paths. |
 | `shared_args` | `string[]` | `[]` | Global llama.cpp options. |
-| `extra_args` | `string[]` | `[]` | Model-specific llama.cpp arguments. |
-| `speculative` | `object` | `{}` | Optional speculative decoding configuration. |
 | `bind_host` | `string` | `"127.0.0.1"` | Bind host for the runtime. |
 | `connect_host` | `string` | `"127.0.0.1"` | Target host the gateway uses to forward proxy requests. |
 
@@ -70,7 +73,7 @@ Specify either a local filepath or Hugging Face Hub attributes:
 
 ### Speculative Decoding
 
-Configured via the `speculative` field under a runtime:
+Configured via the `speculative` field on the model:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -109,4 +112,4 @@ When running multimodal models that require a vision projection adapter (like Qw
 
 ## Example
 
-Refer to [config.example.json](../config.example.json) as the base template for configuring model-first runtime environments.
+Refer to [config.example.json](../config.example.json) as the base template. It assumes you build the backend images from [`docker/`](../docker) first, then reference those local image tags from the single shared `backends` section.

@@ -23,7 +23,7 @@ All routes are rooted at `api_prefix`, which defaults to `/api`.
 
 ### Loading a Model
 
-`POST /api/models/{name}/load` expects a JSON body specifying the target runtime (which must be configured for the requested model):
+`POST /api/models/{name}/load` expects a JSON body specifying the target runtime. In the preferred config shape, models are backend-agnostic and the runtime selects the shared backend definition:
 
 ```json
 {
@@ -45,10 +45,9 @@ Or:
   "name": "gemma",
   "config": {
     "name": "gemma",
-    "runtimes": {
-      "rocm": { ... },
-      "vulkan": { ... }
-    }
+    "source": { ... },
+    "extra_args": [],
+    "speculative": { "type": "none" }
   },
   "status": {
     "name": "gemma",
@@ -62,6 +61,9 @@ Or:
   }
 }
 ```
+
+Legacy note:
+- Older configs may still return `config.runtimes` instead of top-level `source`/`extra_args`/`speculative`.
 
 ---
 
