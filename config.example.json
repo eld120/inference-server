@@ -1,7 +1,6 @@
 {
   "api_prefix": "/api",
   "hf_cache_dir": "~/.cache/huggingface/hub",
-  "hf_token": "your_huggingface_token_here",
   "models": [
     {
       "name": "qwen3.6-27b-mtp-example",
@@ -18,19 +17,28 @@
             "/dev/dri"
           ],
           "shared_args": [
-            "-ngl", "99",
-            "-c", "96000",
-            "-fa", "on",
-            "-np", "1",
+            "-ngl",
+            "99",
+            "-c",
+            "96000",
+            "-fa",
+            "on",
+            "-np",
+            "1",
             "--no-mmap",
             "--cache-prompt",
-            "--cache-type-k", "q8_0",
-            "--cache-type-v", "q8_0"
+            "--cache-type-k",
+            "q8_0",
+            "--cache-type-v",
+            "q8_0"
           ],
           "extra_args": [
-            "--spec-type", "draft-mtp",
-            "--spec-draft-n-max", "2"
-          ]
+            "--spec-draft-n-max",
+            "2"
+          ],
+          "speculative": {
+            "type": "draft-mtp"
+          }
         },
         "vulkan": {
           "source": {
@@ -43,19 +51,28 @@
             "/dev/dri"
           ],
           "shared_args": [
-            "-ngl", "99",
-            "-c", "96000",
-            "-fa", "on",
-            "-np", "1",
+            "-ngl",
+            "99",
+            "-c",
+            "96000",
+            "-fa",
+            "on",
+            "-np",
+            "1",
             "--no-mmap",
             "--cache-prompt",
-            "--cache-type-k", "q8_0",
-            "--cache-type-v", "q8_0"
+            "--cache-type-k",
+            "q8_0",
+            "--cache-type-v",
+            "q8_0"
           ],
           "extra_args": [
-            "--spec-type", "draft-mtp",
-            "--spec-draft-n-max", "2"
-          ]
+            "--spec-draft-n-max",
+            "2"
+          ],
+          "speculative": {
+            "type": "draft-mtp"
+          }
         }
       }
     },
@@ -74,18 +91,67 @@
             "/dev/dri"
           ],
           "shared_args": [
-            "-ngl", "99",
-            "-c", "96000",
-            "-fa", "on",
-            "-np", "1",
+            "-ngl",
+            "99",
+            "-c",
+            "96000",
+            "-fa",
+            "on",
+            "-np",
+            "1",
             "--no-mmap",
             "--cache-prompt",
-            "--cache-type-k", "q8_0",
-            "--cache-type-v", "q8_0"
+            "--cache-type-k",
+            "q8_0",
+            "--cache-type-v",
+            "q8_0"
           ],
           "extra_args": [
-            "--mmproj", "mmproj-BF16.gguf"
+            "--mmproj",
+            "mmproj-BF16.gguf"
           ]
+        }
+      }
+    },
+    {
+      "name": "qwen3.6-27b-vision-mtp-example",
+      "runtimes": {
+        "rocm": {
+          "source": {
+            "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
+            "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
+            "revision": "main"
+          },
+          "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
+          "devices": [
+            "/dev/kfd",
+            "/dev/dri"
+          ],
+          "shared_args": [
+            "-ngl",
+            "99",
+            "-c",
+            "96000",
+            "-fa",
+            "on",
+            "-np",
+            "1",
+            "--no-mmap",
+            "--cache-prompt",
+            "--cache-type-k",
+            "q8_0",
+            "--cache-type-v",
+            "q8_0"
+          ],
+          "extra_args": [
+            "--mmproj",
+            "mmproj-BF16.gguf",
+            "--spec-draft-n-max",
+            "2"
+          ],
+          "speculative": {
+            "type": "draft-mtp"
+          }
         }
       }
     },
@@ -104,14 +170,20 @@
             "/dev/dri"
           ],
           "shared_args": [
-            "-ngl", "99",
-            "-c", "96000",
-            "-fa", "on",
-            "-np", "1",
+            "-ngl",
+            "99",
+            "-c",
+            "96000",
+            "-fa",
+            "on",
+            "-np",
+            "1",
             "--no-mmap",
             "--cache-prompt",
-            "--cache-type-k", "q8_0",
-            "--cache-type-v", "q8_0"
+            "--cache-type-k",
+            "q8_0",
+            "--cache-type-v",
+            "q8_0"
           ],
           "extra_args": [],
           "speculative": {

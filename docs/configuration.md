@@ -24,7 +24,7 @@ Top-level fields:
 |---|---|---|---|
 | `api_prefix` | `string` | `"/api"` | Prefix for all server routes. |
 | `hf_cache_dir` | `string` | `~/.cache/huggingface/hub` | Local Hugging Face cache directory. |
-| `hf_token` | `string \| null` | `null` | Used when no env token is present. |
+| `hf_token` | `string \| null` | `null` | (Discouraged) Fallback if no env token is present. Using environment variables like `HF_TOKEN` or `INF_HF_TOKEN` is strongly preferred for secret hygiene. |
 | `models` | `array` | `[]` | Configured models. |
 
 ---
@@ -60,7 +60,7 @@ Each runtime block specifies the model source and execution details for that spe
 
 Specify either a local filepath or Hugging Face Hub attributes:
 
-- `local_path` (string): Absolute or relative path to a local GGUF model file.
+- `local_path` (string): Absolute or relative path to a local GGUF model file. Relative paths are resolved relative to the directory containing the loaded `config.json` file, and are preserved as relative paths when saved. Tilde `~` paths expand to the user's home directory.
 - `repo_id` (string): The Hugging Face repo name (e.g., `ggml-org/gemma-3-1b-it-GGUF`).
 - `filename` (string): The GGUF filename inside the repo (e.g., `gemma-3-1b-it-Q4_K_M.gguf`).
 - `revision` (string): The repo branch or revision (defaults to `"main"`).
