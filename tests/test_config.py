@@ -69,3 +69,66 @@ def test_runtime_settings_port_precedence(monkeypatch: pytest.MonkeyPatch) -> No
     settings = RuntimeSettings()
     assert settings.runtime_port == 12345
 
+
+def test_hf_cache_dir_expansion() -> None:
+    # 1. hf_cache_dir with ~
+    config = AppConfig(hf_cache_dir="~/.cache/huggingface/hub")
+    expected = Path("~/.cache/huggingface/hub").expanduser().resolve()
+    assert config.hf_cache_dir == expected
+    assert config.hf_cache_dir.is_absolute()
+
+    # 2. hf_cache_dir with an already absolute path
+    config_abs = AppConfig(hf_cache_dir="/absolute/path/to/cache")
+    assert config_abs.hf_cache_dir == Path("/absolute/path/to/cache").resolve()
+    assert config_abs.hf_cache_dir.is_absolute()
+
+
+def test_path_mapping_depends_on_hf_cache_dir() -> None:
+    from manager import ModelRuntimeManager
+
+    cache_dir = Path("/tmp/custom_cache_dir").resolve().absolute()
+    app_config = AppConfig(hf_cache_dir=cache_dir)
+
+    class SimpleHF:
+        def __init__(self, cache_dir: Path):
+            self.cache_dir = cache_dir
+
+    runtime = RuntimeSettings()
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=SimpleHF(cache_dir=cache_dir),  # type: ignore
+    )
+
+    # Case A: Path is inside the cache dir
+    inside_path = cache_dir / "models--org--model" / "snapshots" / "12345" / "model.gguf"
+    mapped_inside = manager._map_model_path_sync(ModelSource(), inside_path)
+    assert mapped_inside == "/huggingface/models--org--model/snapshots/12345/model.gguf"
+
+    # Case B: Path is outside the cache dir
+    outside_path = Path("/tmp/other_dir/some_model.gguf").resolve().absolute()
+    mapped_outside = manager._map_model_path_sync(ModelSource(), outside_path)
+    expected_suffix = manager._dir_hash(outside_path.parent)
+    assert mapped_outside == f"/local_models_{expected_suffix}/some_model.gguf"
+
+
+def test_effective_hf_token_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
+    from config import effective_hf_token
+
+    # Both env and config token set
+    monkeypatch.setenv("INF_HF_TOKEN", "env-token")
+    settings = RuntimeSettings()
+    config = AppConfig(hf_token="config-token")
+    assert effective_hf_token(settings, config) == "env-token"
+
+    # Only config token set
+    monkeypatch.delenv("INF_HF_TOKEN", raising=False)
+    settings_no_env = RuntimeSettings()
+    assert effective_hf_token(settings_no_env, config) == "config-token"
+
+    # No token set
+    config_no_token = AppConfig()
+    assert effective_hf_token(settings_no_env, config_no_token) is None
+
+
+
