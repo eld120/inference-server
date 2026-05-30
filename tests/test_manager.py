@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import builtins
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import docker.errors
@@ -82,6 +84,14 @@ class MockContainer:
     def logs(self, tail: int = 500) -> bytes:
         return b"Hello from mock container\n"
 
+    def exec_run(self, cmd: list[str]) -> Any:
+        return SimpleNamespace(
+            output=(
+                b"1 Ss /app/llama-server --host 0.0.0.0 --port 8080\n"
+                b"24 Sl /app/llama-server --host 127.0.0.1 --port 46951\n"
+            )
+        )
+
 
 class MockContainers:
     def __init__(self) -> None:
@@ -123,6 +133,8 @@ class MockUpstreamApp:
     def __init__(self) -> None:
         self.loaded_models: list[str] = []
         self.unloaded_models: list[str] = []
+        self.readiness_probe_count = 0
+        self.readiness_event: asyncio.Event | None = None
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         path = scope["path"]
@@ -169,6 +181,23 @@ class MockUpstreamApp:
                     {
                         "type": "http.response.body",
                         "body": b'{"object": "list", "data": []}',
+                    }
+                )
+            elif path == "/v1/chat/completions":
+                self.readiness_probe_count += 1
+                if self.readiness_event is not None:
+                    await self.readiness_event.wait()
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 200,
+                        "headers": [(b"content-type", b"application/json")],
+                    }
+                )
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b'{"id":"chatcmpl-ready","choices":[{"message":{"role":"assistant","content":"ok"}}]}',
                     }
                 )
             else:
@@ -312,6 +341,233 @@ async def test_model_runtime_manager_rejects_unsupported_runtime(
 
 
 @pytest.mark.asyncio
+async def test_manager_load_fails_if_worker_dies_after_router_accepts_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    upstream_app = MockUpstreamApp()
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+        proxy_client_factory=lambda base_url: mock_client_factory(
+            base_url, upstream_app
+        ),
+    )
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    class DefunctWorkerContainer(MockContainer):
+        def exec_run(self, cmd: list[str]) -> Any:
+            return SimpleNamespace(
+                output=(
+                    b"1 Ss /app/llama-server --host 0.0.0.0 --port 8080\n"
+                    b"24 Z [llama-server] <defunct>\n"
+                )
+            )
+
+    async def fake_start(self: RuntimeContainer) -> None:
+        self.state = "running"
+        self.container = DefunctWorkerContainer(name="inference-server-runtime-rocm")
+
+    async def fake_stop(self: RuntimeContainer) -> None:
+        self.container = None
+        self.state = "stopped"
+
+    monkeypatch.setattr(RuntimeContainer, "start", fake_start)
+    monkeypatch.setattr(RuntimeContainer, "stop", fake_stop)
+
+    with pytest.raises(RuntimeError, match="died during load"):
+        await manager.load("primary", "rocm")
+
+    assert manager._active_model_name is None
+    assert manager._active_runtime is not None
+    assert manager._active_runtime.state == "error"
+    assert "died during load" in (manager._active_runtime.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_manager_load_waits_for_readiness_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    upstream_app = MockUpstreamApp()
+    upstream_app.readiness_event = asyncio.Event()
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+        proxy_client_factory=lambda base_url: mock_client_factory(
+            base_url, upstream_app
+        ),
+    )
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    load_task = asyncio.create_task(manager.load("primary", "rocm"))
+    await asyncio.sleep(0.05)
+
+    assert load_task.done() is False
+    assert manager._active_runtime is not None
+    assert manager._active_runtime.state == "starting"
+    assert manager._active_model_name is None
+    assert upstream_app.readiness_probe_count >= 1
+
+    upstream_app.readiness_event.set()
+    status = await load_task
+
+    assert status.state == "running"
+    assert status.active is True
+    assert manager._active_model_name == "primary"
+
+
+@pytest.mark.asyncio
+async def test_probe_model_readiness_uses_configured_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = RuntimeSettings(
+        config_path=tmp_path / "config.json",
+        model_readiness_probe_timeout_seconds=12.5,
+    )
+    app_config = AppConfig(models=[])
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+    )
+    runtime_container = RuntimeContainer(
+        "rocm",
+        "primary",
+        RuntimeConfig(
+            docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+            source=ModelSource(local_path=tmp_path / "model.gguf"),
+        ),
+        manager,
+    )
+
+    captured: dict[str, object] = {}
+
+    class ProbeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def post(self, path: str, *args: object, **kwargs: object):
+            captured["path"] = path
+            captured["timeout"] = kwargs.get("timeout")
+            return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(manager, "create_proxy_client", lambda base_url: ProbeClient())
+
+    ready = await runtime_container._probe_model_readiness("primary")
+
+    assert ready is True
+    assert captured["path"] == "/v1/chat/completions"
+    assert captured["timeout"] == 12.5
+
+
+@pytest.mark.asyncio
+async def test_manager_cleans_up_cancelled_load(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+    )
+
+    async def fake_start(self: RuntimeContainer) -> None:
+        self.state = "running"
+        self.container = MockContainer(name="inference-server-runtime-rocm")
+
+    async def fake_load_model(self: RuntimeContainer, name: str) -> None:
+        raise asyncio.CancelledError()
+
+    async def fake_stop(self: RuntimeContainer) -> None:
+        self.container = None
+        self.state = "stopped"
+
+    monkeypatch.setattr(RuntimeContainer, "start", fake_start)
+    monkeypatch.setattr(RuntimeContainer, "load_model", fake_load_model)
+    monkeypatch.setattr(RuntimeContainer, "stop", fake_stop)
+
+    with pytest.raises(asyncio.CancelledError):
+        await manager.load("primary", "rocm")
+
+    assert manager._active_model_name is None
+    assert manager._active_runtime is not None
+    assert manager._active_runtime.state == "error"
+    assert "Load cancelled" in (manager._active_runtime.last_error or "")
+
+
+@pytest.mark.asyncio
 async def test_manager_keeps_active_model_when_new_model_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -389,7 +645,7 @@ async def test_manager_keeps_active_model_when_new_model_fails(
     assert svc_status.models[1].active is False
 
     container = mock_client.containers.get("inference-server-runtime-rocm")
-    assert container.stopped is False
+    assert container.stopped is True
 
 
 @pytest.mark.asyncio
@@ -507,12 +763,13 @@ async def test_open_proxy_session_closes_client_on_send_failure(
         hf=FakeHF(tmp_path),
         proxy_client_factory=factory,
     )
-    # mock starting state
+    # mock ready state
     manager._active_model_name = "primary"
     model_config = manager._get_model_config("primary")
     manager._active_runtime = RuntimeContainer(
         "rocm", "primary", model_config.runtimes["rocm"], manager
     )
+    manager._active_runtime.state = "running"
 
     request = httpx.Request("POST", "http://placeholder/v1/chat/completions")
 
@@ -765,3 +1022,352 @@ async def test_mmproj_download_and_ini_mapping(monkeypatch, tmp_path: Path) -> N
     # Verify that the generated INI config maps the mmproj to its container path
     ini_content = await manager._generate_presets_ini("rocm")
     assert "mmproj = /huggingface/models--org--model/snapshots/main/mmproj-BF16.gguf" in ini_content
+
+
+@pytest.mark.asyncio
+async def test_manager_load_with_pid_1_only_llama_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    class PID1Container(MockContainer):
+        def exec_run(self, cmd: list[str]) -> Any:
+            return SimpleNamespace(
+                output=b"1 S /app/llama-server --host 0.0.0.0 --port 8080\n"
+            )
+
+    async def fake_start(self: RuntimeContainer) -> None:
+        self.state = "running"
+        self.container = PID1Container(name="inference-server-runtime-rocm")
+
+    async def fake_stop(self: RuntimeContainer) -> None:
+        self.container = None
+        self.state = "stopped"
+
+    monkeypatch.setattr(RuntimeContainer, "start", fake_start)
+    monkeypatch.setattr(RuntimeContainer, "stop", fake_stop)
+
+    upstream_app = MockUpstreamApp()
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+        proxy_client_factory=lambda base_url: mock_client_factory(
+            base_url, upstream_app
+        ),
+    )
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    status = await manager.load("primary", "rocm")
+    assert status.state == "running"
+    assert status.active is True
+    assert manager._active_model_name == "primary"
+
+
+@pytest.mark.asyncio
+async def test_manager_load_with_readiness_probe_stalled_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    runtime = RuntimeSettings(
+        config_path=tmp_path / "config.json",
+        model_load_timeout_seconds=7,
+    )
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+    )
+    manager._docker_client = MockDockerClient()
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    class MockLoop:
+        def __init__(self) -> None:
+            self.current_time = 0.0
+        def time(self) -> float:
+            return self.current_time
+
+    mock_loop = MockLoop()
+    monkeypatch.setattr("manager.asyncio.get_running_loop", lambda: mock_loop)
+
+    async def fake_sleep(seconds: float) -> None:
+        mock_loop.current_time += seconds
+
+    monkeypatch.setattr("manager.asyncio.sleep", fake_sleep)
+
+    class StalledClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def get(self, path, *args, **kwargs):
+            return SimpleNamespace(status_code=200)
+        async def post(self, path, *args, **kwargs):
+            if "chat/completions" in path:
+                raise httpx.ReadTimeout("Read timed out", request=None)
+            return SimpleNamespace(status_code=200, text='{"success": true}')
+
+    monkeypatch.setattr(manager, "create_proxy_client", lambda base_url: StalledClient())
+
+    with pytest.raises(
+        TimeoutError,
+        match=r"model 'primary' did not finish loading within 7 seconds",
+    ):
+        await manager.load("primary", "rocm")
+
+    assert manager._lock.locked() is False
+    assert manager._active_model_name is None
+    assert manager._active_runtime is not None
+    assert manager._active_runtime.state == "error"
+    assert (
+        manager._active_runtime.last_error
+        == "model 'primary' did not finish loading within 7 seconds"
+    )
+    assert manager._active_runtime.container is None
+
+
+@pytest.mark.asyncio
+async def test_manager_load_timeout_honors_configured_model_load_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = RuntimeSettings(
+        config_path=tmp_path / "config.json",
+        model_load_timeout_seconds=9,
+    )
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ]
+    )
+
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+    )
+    runtime_container = RuntimeContainer(
+        "rocm",
+        "primary",
+        app_config.models[0].runtimes["rocm"],
+        manager,
+    )
+    runtime_container.container = MockContainer(name="inference-server-runtime-rocm")
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    class MockLoop:
+        def __init__(self) -> None:
+            self.current_time = 0.0
+
+        def time(self) -> float:
+            return self.current_time
+
+    mock_loop = MockLoop()
+    sleep_calls: list[float] = []
+    probe_calls = 0
+
+    monkeypatch.setattr("manager.asyncio.get_running_loop", lambda: mock_loop)
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        mock_loop.current_time += seconds
+
+    monkeypatch.setattr("manager.asyncio.sleep", fake_sleep)
+
+    async def fake_probe(name: str) -> bool:
+        nonlocal probe_calls
+        probe_calls += 1
+        return False
+
+    monkeypatch.setattr(runtime_container, "_probe_model_readiness", fake_probe)
+
+    with pytest.raises(
+        TimeoutError,
+        match=r"model 'primary' did not finish loading within 9 seconds",
+    ):
+        await runtime_container._wait_until_model_loaded("primary")
+
+    assert mock_loop.current_time == 9.0
+    assert probe_calls == 9
+    assert sleep_calls == [1] * 9
+
+
+@pytest.mark.asyncio
+async def test_manager_load_with_missing_ps_exit_code_127(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    class MissingPsContainer(MockContainer):
+        def exec_run(self, cmd: list[str]) -> Any:
+            return SimpleNamespace(
+                exit_code=127,
+                output=b"sh: ps: command not found\n",
+            )
+
+    async def fake_start(self: RuntimeContainer) -> None:
+        self.state = "running"
+        self.container = MissingPsContainer(name="inference-server-runtime-rocm")
+
+    async def fake_stop(self: RuntimeContainer) -> None:
+        self.container = None
+        self.state = "stopped"
+
+    monkeypatch.setattr(RuntimeContainer, "start", fake_start)
+    monkeypatch.setattr(RuntimeContainer, "stop", fake_stop)
+
+    upstream_app = MockUpstreamApp()
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+        proxy_client_factory=lambda base_url: mock_client_factory(
+            base_url, upstream_app
+        ),
+    )
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    status = await manager.load("primary", "rocm")
+    assert status.state == "running"
+    assert status.active is True
+    assert manager._active_model_name == "primary"
+    assert upstream_app.readiness_probe_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_manager_load_with_missing_ps_exec_run_raises_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    class ThrowingPsContainer(MockContainer):
+        def exec_run(self, cmd: list[str]) -> Any:
+            raise RuntimeError("docker exec failed")
+
+    async def fake_start(self: RuntimeContainer) -> None:
+        self.state = "running"
+        self.container = ThrowingPsContainer(name="inference-server-runtime-rocm")
+
+    async def fake_stop(self: RuntimeContainer) -> None:
+        self.container = None
+        self.state = "stopped"
+
+    monkeypatch.setattr(RuntimeContainer, "start", fake_start)
+    monkeypatch.setattr(RuntimeContainer, "stop", fake_stop)
+
+    upstream_app = MockUpstreamApp()
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+        proxy_client_factory=lambda base_url: mock_client_factory(
+            base_url, upstream_app
+        ),
+    )
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    status = await manager.load("primary", "rocm")
+    assert status.state == "running"
+    assert status.active is True
+    assert manager._active_model_name == "primary"
+    assert upstream_app.readiness_probe_count >= 1

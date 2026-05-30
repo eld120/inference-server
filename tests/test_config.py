@@ -51,6 +51,32 @@ def test_runtime_settings_runtime_port_default() -> None:
     assert settings.runtime_port == 39281
 
 
+def test_runtime_settings_model_load_timeout_default() -> None:
+    settings = RuntimeSettings()
+    assert settings.model_load_timeout_seconds == 1800
+
+
+def test_runtime_settings_model_load_timeout_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INF_MODEL_LOAD_TIMEOUT_SECONDS", "2400")
+    settings = RuntimeSettings()
+    assert settings.model_load_timeout_seconds == 2400
+
+
+def test_runtime_settings_model_readiness_probe_timeout_default() -> None:
+    settings = RuntimeSettings()
+    assert settings.model_readiness_probe_timeout_seconds == 5.0
+
+
+def test_runtime_settings_model_readiness_probe_timeout_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INF_MODEL_READINESS_PROBE_TIMEOUT_SECONDS", "2.5")
+    settings = RuntimeSettings()
+    assert settings.model_readiness_probe_timeout_seconds == 2.5
+
+
 def test_runtime_settings_runtime_port_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("INF_RUNTIME_PORT", "12345")
     settings = RuntimeSettings()
@@ -155,4 +181,3 @@ def test_effective_hf_token_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     # No token set
     config_no_token = AppConfig()
     assert effective_hf_token(settings_no_env, config_no_token) is None
-

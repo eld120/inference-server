@@ -277,6 +277,12 @@ class FakeAppManager:
             return self._primary.name
         return None
 
+    def model_resource(self, name: str) -> SimpleNamespace:
+        state = "running" if name in self.loaded else "stopped"
+        return SimpleNamespace(
+            status=SimpleNamespace(state=state, name=name)
+        )
+
     def models(self) -> list[ModelConfig]:
         return [self._primary]
 

@@ -108,6 +108,21 @@ class FakeManager:
         return ProxySession(client=client, response=response)
 
 
+class LoadingManager(FakeManager):
+    def status(self) -> ServiceStatus:
+        return ServiceStatus(
+            healthy=True,
+            api_prefix="/api",
+            config_path="config.json",
+            active_model=None,
+            active_runtime="rocm",
+            models=[self._model_resource],
+        )
+
+    def active_model(self) -> ActiveModelProtocol | None:
+        return None
+
+
 @pytest.mark.asyncio
 async def test_app_routes_and_proxy(tmp_path: Path) -> None:
     model_resource = ModelResource(
@@ -158,3 +173,36 @@ async def test_app_routes_and_proxy(tmp_path: Path) -> None:
         "path": "/v1/chat/completions",
         "query": {"foo": "bar"},
     }
+
+
+@pytest.mark.asyncio
+async def test_app_rejects_completions_while_model_is_loading(tmp_path: Path) -> None:
+    model_resource = ModelResource(
+        name="primary",
+        config=make_model("primary", Path("/models/dummy.gguf")),
+        status=ModelStatus(
+            name="primary",
+            state="starting",
+            model="repo/model.gguf",
+            host="127.0.0.1",
+            port=8080,
+            base_url="http://127.0.0.1:8080",
+            active=False,
+            active_runtime="rocm",
+        ),
+    )
+    app = create_app(
+        app_config=make_app_config(api_prefix="/api", hf_cache_dir=tmp_path),
+        manager=LoadingManager(model_resource),
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/v1/chat/completions",
+            json={"model": "primary"},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Model 'primary' is still loading."}
