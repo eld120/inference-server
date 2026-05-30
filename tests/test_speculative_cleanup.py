@@ -14,12 +14,10 @@ import pytest
 from config import RuntimeSettings
 from manager import ModelRuntimeManager
 from schemas import (
-    AppConfig,
-    ModelConfig,
     ModelSource,
-    RuntimeConfig,
     SpeculativeConfig,
 )
+from tests.helpers import make_app_config, make_backends, make_model
 from tests.test_manager import (
     FakeHF,
     MockDockerClient,
@@ -48,33 +46,17 @@ async def test_speculative_to_non_speculative_clears_draft_path(
     draft_path = tmp_path / "draft.gguf"
 
     runtime = RuntimeSettings(config_path=tmp_path / "config.json")
-    app_config = AppConfig(
-        models=[
-            ModelConfig(
-                name="speculative_model",
-                runtimes={
-                    "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        devices=["/dev/kfd", "/dev/dri"],
-                        source=ModelSource(local_path=tmp_path / "model_a.gguf"),
-                        speculative=SpeculativeConfig(
-                            type="draft",
-                            draft_model=ModelSource(local_path=draft_path),
-                        ),
-                    )
-                },
+    app_config = make_app_config(
+        make_model(
+            "speculative_model",
+            tmp_path / "model_a.gguf",
+            speculative=SpeculativeConfig(
+                type="draft",
+                draft_model=ModelSource(local_path=draft_path),
             ),
-            ModelConfig(
-                name="plain_model",
-                runtimes={
-                    "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        devices=["/dev/kfd", "/dev/dri"],
-                        source=ModelSource(local_path=tmp_path / "model_b.gguf"),
-                    )
-                },
-            ),
-        ],
+        ),
+        make_model("plain_model", tmp_path / "model_b.gguf"),
+        backends=make_backends(rocm_devices=["/dev/kfd", "/dev/dri"]),
     )
 
     upstream_app = MockUpstreamApp()
@@ -134,33 +116,17 @@ async def test_non_speculative_to_speculative_sets_draft_path(
     draft_path = tmp_path / "draft.gguf"
 
     runtime = RuntimeSettings(config_path=tmp_path / "config.json")
-    app_config = AppConfig(
-        models=[
-            ModelConfig(
-                name="plain_model",
-                runtimes={
-                    "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        devices=["/dev/kfd", "/dev/dri"],
-                        source=ModelSource(local_path=tmp_path / "model_a.gguf"),
-                    )
-                },
+    app_config = make_app_config(
+        make_model("plain_model", tmp_path / "model_a.gguf"),
+        make_model(
+            "speculative_model",
+            tmp_path / "model_b.gguf",
+            speculative=SpeculativeConfig(
+                type="draft",
+                draft_model=ModelSource(local_path=draft_path),
             ),
-            ModelConfig(
-                name="speculative_model",
-                runtimes={
-                    "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        devices=["/dev/kfd", "/dev/dri"],
-                        source=ModelSource(local_path=tmp_path / "model_b.gguf"),
-                        speculative=SpeculativeConfig(
-                            type="draft",
-                            draft_model=ModelSource(local_path=draft_path),
-                        ),
-                    )
-                },
-            ),
-        ],
+        ),
+        backends=make_backends(rocm_devices=["/dev/kfd", "/dev/dri"]),
     )
 
     upstream_app = MockUpstreamApp()

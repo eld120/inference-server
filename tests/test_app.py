@@ -16,10 +16,10 @@ from schemas import (
     ModelResource,
     ModelSource,
     ModelStatus,
-    RuntimeConfig,
     ServiceStatus,
     SpeculativeConfig,
 )
+from tests.helpers import make_app_config, make_model
 
 
 class FakeManager:
@@ -67,14 +67,9 @@ class FakeManager:
 
     def models(self) -> list[ModelConfig]:
         return [
-            ModelConfig(
-                name=self._model_resource.name,
-                runtimes={
-                    "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        source=ModelSource(local_path=Path("/models/dummy.gguf")),
-                    )
-                },
+            make_model(
+                self._model_resource.name,
+                Path("/models/dummy.gguf"),
             )
         ]
 
@@ -117,15 +112,10 @@ class FakeManager:
 async def test_app_routes_and_proxy(tmp_path: Path) -> None:
     model_resource = ModelResource(
         name="primary",
-        config=ModelConfig(
-            name="primary",
-            runtimes={
-                "rocm": RuntimeConfig(
-                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                    source=ModelSource(local_path=Path("/models/dummy.gguf")),
-                    speculative=SpeculativeConfig(type="draft-mtp"),
-                )
-            },
+        config=make_model(
+            "primary",
+            Path("/models/dummy.gguf"),
+            speculative=SpeculativeConfig(type="draft-mtp"),
         ),
         status=ModelStatus(
             name="primary",
@@ -140,7 +130,7 @@ async def test_app_routes_and_proxy(tmp_path: Path) -> None:
         ),
     )
     app = create_app(
-        app_config=AppConfig(models=[], api_prefix="/api", hf_cache_dir=tmp_path),
+        app_config=make_app_config(api_prefix="/api", hf_cache_dir=tmp_path),
         manager=FakeManager(model_resource),
     )
     async with AsyncClient(

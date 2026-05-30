@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from config import RuntimeSettings, load_app_config, save_app_config
-from schemas import AppConfig, ModelConfig, ModelSource, RuntimeConfig
+from schemas import AppConfig, BackendConfig, ModelConfig, ModelSource, RuntimeConfig
 
 
 def test_app_config_round_trip(tmp_path: Path) -> None:
@@ -16,7 +16,7 @@ def test_app_config_round_trip(tmp_path: Path) -> None:
                 name="gemma",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd", "/dev/dri"],
                         source=ModelSource(local_path=tmp_path / "model.gguf"),
                     )
@@ -32,7 +32,7 @@ def test_app_config_round_trip(tmp_path: Path) -> None:
 
     assert (
         loaded.models[0].runtimes["rocm"].docker_image
-        == "ghcr.io/ggerganov/llama.cpp:server-rocm"
+        == "inference-server-llama-rocm:7.2.1-7e50ef7"
     )
     assert loaded.models[0].name == "gemma"
     assert (
@@ -83,6 +83,32 @@ def test_hf_cache_dir_expansion() -> None:
     assert config_abs.hf_cache_dir.is_absolute()
 
 
+def test_shared_backend_config_round_trip(tmp_path: Path) -> None:
+    config = AppConfig(
+        hf_cache_dir=tmp_path / "hf-cache",
+        backends={
+            "rocm": BackendConfig(
+                docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                devices=["/dev/kfd", "/dev/dri"],
+            )
+        },
+        models=[
+            ModelConfig(
+                name="gemma",
+                source=ModelSource(local_path=tmp_path / "model.gguf"),
+            )
+        ],
+    )
+
+    path = tmp_path / "config.json"
+    save_app_config(path, config)
+    loaded = load_app_config(path)
+
+    assert loaded.backends["rocm"].docker_image == "inference-server-llama-rocm:7.2.1-7e50ef7"
+    assert loaded.models[0].source is not None
+    assert loaded.models[0].source.local_path == tmp_path / "model.gguf"
+
+
 def test_path_mapping_depends_on_hf_cache_dir() -> None:
     from manager import ModelRuntimeManager
 
@@ -129,6 +155,4 @@ def test_effective_hf_token_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     # No token set
     config_no_token = AppConfig()
     assert effective_hf_token(settings_no_env, config_no_token) is None
-
-
 

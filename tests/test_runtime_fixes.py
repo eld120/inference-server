@@ -12,6 +12,7 @@ from config import RuntimeSettings
 from manager import ModelRuntimeManager, RuntimeContainer
 from schemas import (
     AppConfig,
+    BackendConfig,
     ModelConfig,
     ModelSource,
     RuntimeConfig,
@@ -58,7 +59,7 @@ async def test_runtime_startup_path_and_volumes(
                 name="primary",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd", "/dev/dri"],
                         source=ModelSource(local_path=tmp_path / "model.gguf"),
                     )
@@ -100,6 +101,53 @@ async def test_runtime_startup_path_and_volumes(
 
 
 @pytest.mark.asyncio
+async def test_shared_backend_config_loads_model_on_selected_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        backends={
+            "rocm": BackendConfig(
+                docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                devices=["/dev/kfd", "/dev/dri"],
+            )
+        },
+        models=[
+            ModelConfig(
+                name="primary",
+                source=ModelSource(local_path=tmp_path / "model.gguf"),
+            )
+        ],
+    )
+
+    upstream_app = MockUpstreamApp()
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+        proxy_client_factory=lambda base_url: mock_client_factory(
+            base_url, upstream_app
+        ),
+    )
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    status = await manager.load("primary", "rocm")
+
+    assert status.active is True
+    assert status.status.active_runtime == "rocm"
+    assert manager._active_runtime is not None
+    assert manager._active_runtime.docker_image == "inference-server-llama-rocm:7.2.1-7e50ef7"
+
+
+@pytest.mark.asyncio
 async def test_extra_args_short_and_long_translation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -110,7 +158,7 @@ async def test_extra_args_short_and_long_translation(
                 name="primary",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model.gguf"),
                         extra_args=[
                             "-ngl",
@@ -176,7 +224,7 @@ async def test_status_correctness_after_runtime_swap(
                 name="model_a",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd", "/dev/dri"],
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                     )
@@ -186,7 +234,7 @@ async def test_status_correctness_after_runtime_swap(
                 name="model_b",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd", "/dev/dri"],
                         source=ModelSource(local_path=tmp_path / "model_b.gguf"),
                     )
@@ -232,6 +280,75 @@ async def test_status_correctness_after_runtime_swap(
 
 
 @pytest.mark.asyncio
+async def test_load_retries_by_restarting_after_failed_runtime_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+    )
+
+    start_attempts = 0
+    load_attempts = 0
+
+    async def fake_start(self: RuntimeContainer) -> None:
+        nonlocal start_attempts
+        start_attempts += 1
+        if start_attempts == 1:
+            self.state = "error"
+            self.container = None
+            self.last_error = "initial startup failed"
+            raise RuntimeError("initial startup failed")
+        self.state = "running"
+        self.container = MockContainer(name="inference-server-runtime-rocm")
+
+    async def fake_load_model(self: RuntimeContainer, name: str) -> None:
+        nonlocal load_attempts
+        load_attempts += 1
+
+    async def fake_stop(self: RuntimeContainer) -> None:
+        self.container = None
+        self.state = "stopped"
+
+    monkeypatch.setattr(RuntimeContainer, "start", fake_start)
+    monkeypatch.setattr(RuntimeContainer, "load_model", fake_load_model)
+    monkeypatch.setattr(RuntimeContainer, "stop", fake_stop)
+
+    with pytest.raises(RuntimeError, match="initial startup failed"):
+        await manager.load("primary", "rocm")
+
+    assert manager._active_runtime is not None
+    assert manager._active_runtime.state == "error"
+
+    status = await manager.load("primary", "rocm")
+
+    assert status.active is True
+    assert status.state == "running"
+    assert start_attempts == 2
+    assert load_attempts == 1
+
+
+@pytest.mark.asyncio
 async def test_proxy_canonical_model_key(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -252,7 +369,7 @@ async def test_proxy_canonical_model_key(
                 name="gemma",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "gemma.gguf"),
                     )
                 },
@@ -399,7 +516,7 @@ async def test_runtime_model_path_matches_resolved_hf_cache(
                 name="remote_model",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(repo_id=repo_id, filename=filename),
                     )
                 },
@@ -511,7 +628,7 @@ async def test_runtime_load_failure_state_correctness(
                 name="gemma",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "gemma.gguf"),
                     )
                 },
@@ -568,7 +685,7 @@ async def test_runtime_swap_failure_leaves_honest_state(
                 name="model_a",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                     )
                 },
@@ -577,7 +694,7 @@ async def test_runtime_swap_failure_leaves_honest_state(
                 name="model_b",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_b.gguf"),
                     )
                 },
@@ -637,7 +754,7 @@ async def test_runtime_dynamic_model_regeneration_on_swap(
                 name="model_a",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                     )
                 },
@@ -646,7 +763,7 @@ async def test_runtime_dynamic_model_regeneration_on_swap(
                 name="model_b",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_b.gguf"),
                     )
                 },
@@ -723,7 +840,7 @@ async def test_runtime_cache_lookup_respects_revision(
                 name="m1",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(
                             repo_id="org/model", filename="model.gguf", revision="main"
                         ),
@@ -734,7 +851,7 @@ async def test_runtime_cache_lookup_respects_revision(
                 name="m2",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(
                             repo_id="org/model", filename="model.gguf", revision="other"
                         ),
@@ -851,7 +968,7 @@ async def test_runtime_unload_failure_state_handling(
                 name="model_old",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(
                             repo_id=repo_id, filename=filename, revision="oldrev"
                         ),
@@ -862,7 +979,7 @@ async def test_runtime_unload_failure_state_handling(
                 name="model_new",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(
                             repo_id=repo_id, filename=filename, revision="newrev"
                         ),

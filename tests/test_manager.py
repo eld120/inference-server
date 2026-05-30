@@ -43,7 +43,7 @@ class FailingHF(FakeHF):
 
 class MockImages:
     def __init__(self) -> None:
-        self.downloaded_images = {"ghcr.io/ggerganov/llama.cpp:server-rocm"}
+        self.downloaded_images = {"inference-server-llama-rocm:7.2.1-7e50ef7"}
 
     def get(self, name: str) -> str:
         if name in self.downloaded_images:
@@ -218,7 +218,7 @@ async def test_model_runtime_manager_load_and_unload(
                 name="primary",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd", "/dev/dri"],
                         source=ModelSource(local_path=tmp_path / "model.gguf"),
                         speculative=SpeculativeConfig(type="draft-mtp"),
@@ -292,7 +292,7 @@ async def test_model_runtime_manager_rejects_unsupported_runtime(
                 name="primary",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd", "/dev/dri"],
                         source=ModelSource(local_path=tmp_path / "model.gguf"),
                     )
@@ -335,7 +335,7 @@ async def test_manager_keeps_active_model_when_new_model_fails(
                 name="primary",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd", "/dev/dri"],
                         source=ModelSource(local_path=tmp_path / "model.gguf"),
                     )
@@ -345,7 +345,7 @@ async def test_manager_keeps_active_model_when_new_model_fails(
                 name="secondary",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd", "/dev/dri"],
                         source=ModelSource(
                             repo_id="broken/repo", filename="model.gguf"
@@ -409,7 +409,7 @@ async def test_global_cleanup_stops_only_labeled_containers(
                 name="model1",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd", "/dev/dri"],
                         source=ModelSource(local_path=tmp_path / "m1.gguf"),
                     )
@@ -466,7 +466,7 @@ async def test_open_proxy_session_closes_client_on_send_failure(
                 name="primary",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd", "/dev/dri"],
                         source=ModelSource(local_path=tmp_path / "model.gguf"),
                     )
@@ -545,7 +545,7 @@ async def test_unload_failure_preserves_runtime_state_and_honors_status(
                 name="primary",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model.gguf"),
                     )
                 },
@@ -644,7 +644,7 @@ async def test_runtime_timeout_error(tmp_path: Path, monkeypatch: pytest.MonkeyP
                 name="gemma",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "gemma.gguf"),
                     )
                 },
@@ -733,7 +733,7 @@ async def test_mmproj_download_and_ini_mapping(monkeypatch, tmp_path: Path) -> N
                 name="m_vision",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(
                             repo_id="org/model", filename="model.gguf", revision="main"
                         ),
@@ -765,4 +765,3 @@ async def test_mmproj_download_and_ini_mapping(monkeypatch, tmp_path: Path) -> N
     # Verify that the generated INI config maps the mmproj to its container path
     ini_content = await manager._generate_presets_ini("rocm")
     assert "mmproj = /huggingface/models--org--model/snapshots/main/mmproj-BF16.gguf" in ini_content
-

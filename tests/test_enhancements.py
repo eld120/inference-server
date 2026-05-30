@@ -32,7 +32,7 @@ class FakeHF:
 
 class MockImages:
     def __init__(self) -> None:
-        self.downloaded_images = {"ghcr.io/ggerganov/llama.cpp:server-rocm"}
+        self.downloaded_images = {"inference-server-llama-rocm:7.2.1-7e50ef7"}
 
     def get(self, name: str) -> str:
         if name in self.downloaded_images:
@@ -113,7 +113,7 @@ async def test_find_model_for_name(monkeypatch: pytest.MonkeyPatch) -> None:
                 name="gemma",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(
                             repo_id="ggml-org/gemma-3-1b-it-GGUF",
                             filename="gemma-3-1b-it-Q4_K_M.gguf",
@@ -142,7 +142,7 @@ async def test_logs_capturing_and_get_logs(monkeypatch: pytest.MonkeyPatch) -> N
                 name="gemma",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=Path("mock.gguf")),
                     )
                 },
@@ -181,7 +181,7 @@ async def test_vram_safe_swap(monkeypatch: pytest.MonkeyPatch) -> None:
                 name="model1",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=Path("b1.gguf")),
                         connect_host="127.0.0.1",
                     )
@@ -191,7 +191,7 @@ async def test_vram_safe_swap(monkeypatch: pytest.MonkeyPatch) -> None:
                 name="model2",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=Path("b2.gguf")),
                         # make them incompatible to trigger container restart
                         connect_host="127.0.0.2",
@@ -306,7 +306,7 @@ async def test_app_strict_mismatch_and_explicit_load() -> None:
         name="gemma",
         runtimes={
             "rocm": RuntimeConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                 source=ModelSource(local_path=Path("mock.gguf")),
             )
         },
@@ -348,7 +348,7 @@ async def test_unknown_model_rejected() -> None:
         name="gemma",
         runtimes={
             "rocm": RuntimeConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                 source=ModelSource(local_path=Path("mock.gguf")),
             )
         },
@@ -386,7 +386,7 @@ async def test_container_spawn_failure_sets_error_state(
                 name="gemma",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=Path("mock.gguf")),
                     )
                 },
@@ -442,7 +442,7 @@ async def test_resolver_failure_sets_error_state(
                 name="gemma",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=Path("mock.gguf")),
                     )
                 },
@@ -487,7 +487,7 @@ async def test_container_boot_crash_sets_error_state(
                 name="gemma",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=Path("mock.gguf")),
                     )
                 },

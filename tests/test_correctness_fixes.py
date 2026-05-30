@@ -11,12 +11,8 @@ from httpx import ASGITransport, AsyncClient
 from app import create_app
 from config import RuntimeSettings
 from manager import ModelRuntimeManager, RuntimeContainer
-from schemas import (
-    AppConfig,
-    ModelConfig,
-    ModelSource,
-    RuntimeConfig,
-)
+from schemas import AppConfig, ModelConfig, ModelSource, RuntimeConfig
+from tests.helpers import make_app_config, make_model
 from tests.test_manager import (
     FakeHF,
     MockDockerClient,
@@ -41,27 +37,9 @@ async def test_swap_failure_rollback(
         "manager.ModelRuntimeManager._resolve_commit_hash", fake_resolve_commit_hash
     )
 
-    app_config = AppConfig(
-        models=[
-            ModelConfig(
-                name="model_a",
-                runtimes={
-                    "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        source=ModelSource(local_path=tmp_path / "model_a.gguf"),
-                    )
-                },
-            ),
-            ModelConfig(
-                name="model_b",
-                runtimes={
-                    "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        source=ModelSource(local_path=tmp_path / "model_b.gguf"),
-                    )
-                },
-            ),
-        ],
+    app_config = make_app_config(
+        make_model("model_a", tmp_path / "model_a.gguf"),
+        make_model("model_b", tmp_path / "model_b.gguf"),
     )
 
     upstream_app = MockUpstreamApp()
@@ -151,19 +129,7 @@ async def test_stop_failure_leaves_error_state(
 
     monkeypatch.setattr(mock_client.containers, "run", run_spy)
 
-    app_config = AppConfig(
-        models=[
-            ModelConfig(
-                name="model_a",
-                runtimes={
-                    "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        source=ModelSource(local_path=tmp_path / "model_a.gguf"),
-                    )
-                },
-            ),
-        ],
-    )
+    app_config = make_app_config(make_model("model_a", tmp_path / "model_a.gguf"))
 
     upstream_app = MockUpstreamApp()
     manager = ModelRuntimeManager(
@@ -200,28 +166,10 @@ async def test_v1_models_discovery(tmp_path: Path) -> None:
     """Gateway v1/models endpoints should return all configured models
     without failing when no runtime is loaded.
     """
-    app_config = AppConfig(
+    app_config = make_app_config(
+        make_model("gemma", tmp_path / "gemma.gguf"),
+        make_model("qwen", tmp_path / "qwen.gguf"),
         api_prefix="/api",
-        models=[
-            ModelConfig(
-                name="gemma",
-                runtimes={
-                    "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        source=ModelSource(local_path=tmp_path / "gemma.gguf"),
-                    )
-                },
-            ),
-            ModelConfig(
-                name="qwen",
-                runtimes={
-                    "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        source=ModelSource(local_path=tmp_path / "qwen.gguf"),
-                    )
-                },
-            ),
-        ],
     )
 
     runtime = RuntimeSettings(config_path=tmp_path / "config.json")
@@ -290,7 +238,7 @@ async def test_connect_host_incompatibility(
                 name="model_a",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                         connect_host="127.0.0.1",
                     )
@@ -300,7 +248,7 @@ async def test_connect_host_incompatibility(
                 name="model_b",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_b.gguf"),
                         connect_host="10.0.0.5",  # Different connect_host
                     )
@@ -343,19 +291,7 @@ async def test_health_status_reflects_error_state(
     mock_client = MockDockerClient()
     monkeypatch.setattr("docker.from_env", lambda: mock_client)
 
-    app_config = AppConfig(
-        models=[
-            ModelConfig(
-                name="model_a",
-                runtimes={
-                    "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        source=ModelSource(local_path=tmp_path / "model_a.gguf"),
-                    )
-                },
-            ),
-        ],
-    )
+    app_config = make_app_config(make_model("model_a", tmp_path / "model_a.gguf"))
 
     upstream_app = MockUpstreamApp()
     manager = ModelRuntimeManager(

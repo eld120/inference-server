@@ -5,6 +5,7 @@ from pydantic import ValidationError
 from manager import ModelRuntimeManager
 from config import RuntimeSettings
 from schemas import AppConfig, ModelSource
+from tests.helpers import make_app_config, make_model
 
 
 class SimpleHF:
@@ -17,44 +18,44 @@ class SimpleHF:
 
 def test_parse_mtp_model_from_config() -> None:
     data = {
+        "backends": {
+            "rocm": {
+                "docker_image": "inference-server-llama-rocm:7.2.1-7e50ef7",
+            }
+        },
         "models": [
             {
                 "name": "qwen3.6-27b-q4-mtp",
-                "runtimes": {
-                    "rocm": {
-                        "source": {
-                            "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
-                            "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-                        },
-                        "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        "speculative": {"type": "draft-mtp"},
-                        "extra_args": ["--spec-draft-n-max", "2"],
-                    }
+                "source": {
+                    "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
+                    "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
                 },
+                "speculative": {"type": "draft-mtp"},
+                "extra_args": ["--spec-draft-n-max", "2"],
             }
         ]
     }
     config = AppConfig.model_validate(data)
-    rocm_runtime = config.models[0].runtimes["rocm"]
-    assert rocm_runtime.speculative.type == "draft-mtp"
-    assert rocm_runtime.extra_args == ["--spec-draft-n-max", "2"]
+    model = config.models[0]
+    assert model.speculative.type == "draft-mtp"
+    assert model.extra_args == ["--spec-draft-n-max", "2"]
 
 
 def test_reject_spec_type_in_extra_args() -> None:
     data = {
+        "backends": {
+            "rocm": {
+                "docker_image": "inference-server-llama-rocm:7.2.1-7e50ef7",
+            }
+        },
         "models": [
             {
                 "name": "invalid-mtp",
-                "runtimes": {
-                    "rocm": {
-                        "source": {
-                            "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
-                            "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-                        },
-                        "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        "extra_args": ["--spec-type", "draft-mtp"],
-                    }
+                "source": {
+                    "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
+                    "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
                 },
+                "extra_args": ["--spec-type", "draft-mtp"],
             }
         ]
     }
@@ -65,24 +66,17 @@ def test_reject_spec_type_in_extra_args() -> None:
 def test_qwen_mtp_status(tmp_path: Path) -> None:
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    config = AppConfig(
+    config = make_app_config(
+        make_model(
+            "qwen3.6-27b-q4-mtp",
+            ModelSource(
+                repo_id="unsloth/Qwen3.6-27B-MTP-GGUF",
+                filename="Qwen3.6-27B-UD-Q4_K_XL.gguf",
+            ),
+            speculative={"type": "draft-mtp"},  # type: ignore[arg-type]
+            extra_args=["--spec-draft-n-max", "2"],
+        ),
         hf_cache_dir=cache_dir,
-        models=[
-            {
-                "name": "qwen3.6-27b-q4-mtp",
-                "runtimes": {
-                    "rocm": {
-                        "source": {
-                            "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
-                            "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-                        },
-                        "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        "speculative": {"type": "draft-mtp"},
-                        "extra_args": ["--spec-draft-n-max", "2"],
-                    }
-                },
-            }
-        ],  # type: ignore
     )
     runtime = RuntimeSettings()
     manager = ModelRuntimeManager(
@@ -103,24 +97,17 @@ async def test_qwen_mtp_presets_ini(tmp_path: Path) -> None:
     model_file = model_dir / "Qwen3.6-27B-UD-Q4_K_XL.gguf"
     model_file.touch()
 
-    config = AppConfig(
+    config = make_app_config(
+        make_model(
+            "qwen3.6-27b-q4-mtp",
+            ModelSource(
+                repo_id="unsloth/Qwen3.6-27B-MTP-GGUF",
+                filename="Qwen3.6-27B-UD-Q4_K_XL.gguf",
+            ),
+            speculative={"type": "draft-mtp"},  # type: ignore[arg-type]
+            extra_args=["--spec-draft-n-max", "2"],
+        ),
         hf_cache_dir=cache_dir,
-        models=[
-            {
-                "name": "qwen3.6-27b-q4-mtp",
-                "runtimes": {
-                    "rocm": {
-                        "source": {
-                            "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
-                            "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-                        },
-                        "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        "speculative": {"type": "draft-mtp"},
-                        "extra_args": ["--spec-draft-n-max", "2"],
-                    }
-                },
-            }
-        ],  # type: ignore
     )
     runtime = RuntimeSettings()
     manager = ModelRuntimeManager(
@@ -152,29 +139,22 @@ async def test_qwen_combined_vision_mtp_presets_ini(tmp_path: Path) -> None:
     mmproj_file = model_dir / "mmproj-BF16.gguf"
     mmproj_file.touch()
 
-    config = AppConfig(
+    config = make_app_config(
+        make_model(
+            "qwen3.6-27b-q4-vision-mtp",
+            ModelSource(
+                repo_id="unsloth/Qwen3.6-27B-MTP-GGUF",
+                filename="Qwen3.6-27B-UD-Q4_K_XL.gguf",
+            ),
+            speculative={"type": "draft-mtp"},  # type: ignore[arg-type]
+            extra_args=[
+                "--mmproj",
+                "mmproj-BF16.gguf",
+                "--spec-draft-n-max",
+                "2",
+            ],
+        ),
         hf_cache_dir=cache_dir,
-        models=[
-            {
-                "name": "qwen3.6-27b-q4-vision-mtp",
-                "runtimes": {
-                    "rocm": {
-                        "source": {
-                            "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
-                            "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-                        },
-                        "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        "speculative": {"type": "draft-mtp"},
-                        "extra_args": [
-                            "--mmproj",
-                            "mmproj-BF16.gguf",
-                            "--spec-draft-n-max",
-                            "2",
-                        ],
-                    }
-                },
-            }
-        ],  # type: ignore
     )
     runtime = RuntimeSettings()
 
@@ -225,4 +205,3 @@ async def test_qwen_combined_vision_mtp_presets_ini(tmp_path: Path) -> None:
         "mmproj = /huggingface/unsloth/Qwen3.6-27B-MTP-GGUF/mmproj-BF16.gguf"
         in ini_content
     )
-

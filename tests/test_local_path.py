@@ -41,7 +41,7 @@ def test_relative_path_resolved_against_config_dir(tmp_path: Path) -> None:
                 "runtimes": {
                     "rocm": {
                         "source": {"local_path": "./model.gguf"},
-                        "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        "docker_image": "inference-server-llama-rocm:7.2.1-7e50ef7",
                         "speculative": {
                             "type": "draft",
                             "draft_model": {"local_path": "./draft.gguf"},
@@ -82,7 +82,7 @@ def test_absolute_local_path_unchanged(tmp_path: Path) -> None:
                 "runtimes": {
                     "rocm": {
                         "source": {"local_path": abs_path},
-                        "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        "docker_image": "inference-server-llama-rocm:7.2.1-7e50ef7",
                     }
                 },
             }
@@ -132,7 +132,7 @@ def test_local_path_round_trip(tmp_path: Path) -> None:
                 "runtimes": {
                     "rocm": {
                         "source": {"local_path": "./model.gguf"},
-                        "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        "docker_image": "inference-server-llama-rocm:7.2.1-7e50ef7",
                         "speculative": {
                             "type": "draft",
                             "draft_model": {"local_path": "./draft.gguf"},
@@ -182,7 +182,7 @@ def test_absolute_paths_under_config_dir_remain_absolute(tmp_path: Path) -> None
                 "runtimes": {
                     "rocm": {
                         "source": {"local_path": abs_model_path},
-                        "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        "docker_image": "inference-server-llama-rocm:7.2.1-7e50ef7",
                         "speculative": {
                             "type": "draft",
                             "draft_model": {"local_path": abs_draft_path},
@@ -225,7 +225,7 @@ def test_relative_path_escaping_config_dir_round_trip(tmp_path: Path) -> None:
                 "runtimes": {
                     "rocm": {
                         "source": {"local_path": "../models/model.gguf"},
-                        "docker_image": "ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        "docker_image": "inference-server-llama-rocm:7.2.1-7e50ef7",
                         "speculative": {
                             "type": "draft",
                             "draft_model": {"local_path": "../drafts/draft.gguf"},
@@ -255,6 +255,5 @@ def test_relative_path_escaping_config_dir_round_trip(tmp_path: Path) -> None:
 
     assert saved_rocm["source"]["local_path"] == "../models/model.gguf"
     assert saved_rocm["speculative"]["draft_model"]["local_path"] == "../drafts/draft.gguf"
-
 
 

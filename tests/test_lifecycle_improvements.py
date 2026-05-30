@@ -85,7 +85,7 @@ async def test_reuse_compatible_runtime(setup_mocks, tmp_path: Path) -> None:
                 name="model_a",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd"],
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                         shared_args=["-c", "2048"],
@@ -96,7 +96,7 @@ async def test_reuse_compatible_runtime(setup_mocks, tmp_path: Path) -> None:
                 name="model_b",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd"],
                         source=ModelSource(local_path=tmp_path / "model_b.gguf"),
                         shared_args=["-c", "2048"],  # identical
@@ -141,7 +141,7 @@ async def test_no_reuse_when_shared_args_differ(setup_mocks, tmp_path: Path) -> 
                 name="model_a",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd"],
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                         shared_args=["-c", "2048"],
@@ -152,7 +152,7 @@ async def test_no_reuse_when_shared_args_differ(setup_mocks, tmp_path: Path) -> 
                 name="model_b",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd"],
                         source=ModelSource(local_path=tmp_path / "model_b.gguf"),
                         shared_args=["-c", "4096"],  # different shared_args
@@ -199,11 +199,11 @@ async def test_runtime_switch_removes_old_container(
                 name="model_a",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                     ),
                     "vulkan": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-vulkan",
+                        docker_image="inference-server-llama-vulkan:26.04-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                     ),
                 },
@@ -249,7 +249,7 @@ async def test_unload_removes_active_container(setup_mocks, tmp_path: Path) -> N
                 name="model_a",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                     )
                 },
@@ -294,7 +294,7 @@ async def test_status_after_unload(setup_mocks, tmp_path: Path) -> None:
                 name="model_a",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                     )
                 },
@@ -344,7 +344,7 @@ async def test_preset_generation_no_ngl_injection(setup_mocks, tmp_path: Path) -
                 name="model_a",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                     )
                 },
@@ -379,7 +379,7 @@ async def test_shared_args_ngl_propagation(setup_mocks, tmp_path: Path) -> None:
                 name="model_a",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                         shared_args=["-ngl", "99"],
                     )
@@ -422,7 +422,7 @@ async def test_cleanup_success_clears_active_state(setup_mocks, tmp_path: Path) 
                 name="model_a",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                     )
                 },
@@ -473,7 +473,7 @@ async def test_cleanup_failure_preserves_honest_state_and_status(
                 name="model_a",
                 runtimes={
                     "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         source=ModelSource(local_path=tmp_path / "model_a.gguf"),
                     )
                 },

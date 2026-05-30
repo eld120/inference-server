@@ -329,7 +329,7 @@ async def test_app_observability_endpoints(tmp_path):
             name="primary",
             runtimes={
                 "rocm": RuntimeConfig(
-                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                    docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                     source=ModelSource(local_path=Path("/models/dummy.gguf")),
                 )
             },
@@ -440,7 +440,7 @@ async def test_app_observability_request_serving(tmp_path):
             name="primary",
             runtimes={
                 "rocm": RuntimeConfig(
-                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                    docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                     source=ModelSource(local_path=Path("/models/dummy.gguf")),
                 )
             },
@@ -526,7 +526,7 @@ async def test_app_observability_request_serving_streaming(tmp_path):
             name="primary",
             runtimes={
                 "rocm": RuntimeConfig(
-                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                    docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                     source=ModelSource(local_path=Path("/models/dummy.gguf")),
                 )
             },
@@ -614,7 +614,7 @@ async def test_app_observability_request_serving_failures(tmp_path):
             name="primary",
             runtimes={
                 "rocm": RuntimeConfig(
-                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                    docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                     source=ModelSource(local_path=Path("/models/dummy.gguf")),
                 )
             },
@@ -678,7 +678,7 @@ async def test_app_observability_db_write_failures(tmp_path):
             name="primary",
             runtimes={
                 "rocm": RuntimeConfig(
-                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                    docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                     source=ModelSource(local_path=Path("/models/dummy.gguf")),
                 )
             },
@@ -866,7 +866,7 @@ async def test_app_observability_db_write_recovery_and_non_blocking_latency(tmp_
             name="primary",
             runtimes={
                 "rocm": RuntimeConfig(
-                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                    docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                     source=ModelSource(local_path=Path("/models/dummy.gguf")),
                 )
             },
@@ -1500,6 +1500,5 @@ async def test_telemetry_retry_shutdown(tmp_path):
     sessions = new_db.get_serving_sessions()
     assert len(sessions) == 1
     assert sessions[0]["end_time"] is not None
-
 
 

@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from schemas import (
     AppConfig,
+    BackendConfig,
     ModelConfig,
     ModelSource,
     RuntimeConfig,
@@ -85,7 +86,7 @@ def test_speculative_ngram_types_ok() -> None:
 # ---------------------------------------------------------------------------
 
 _ROCM_RUNTIME = RuntimeConfig(
-    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+    docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
     source=ModelSource(local_path=Path("/models/main.gguf")),
 )
 
@@ -117,7 +118,10 @@ def test_unique_model_names_ok() -> None:
 
 
 def test_no_runtimes_rejected() -> None:
-    with pytest.raises(ValidationError, match="must have at least one runtime"):
+    with pytest.raises(
+        ValidationError,
+        match="source/backends usage or at least one runtime configured",
+    ):
         ModelConfig(
             name="gemma",
             runtimes={},
@@ -145,7 +149,7 @@ def test_model_source_repo_id_without_filename_rejected() -> None:
             name="bad",
             runtimes={
                 "rocm": RuntimeConfig(
-                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                    docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                     source=ModelSource(repo_id="org/model"),
                 )
             },
@@ -157,7 +161,7 @@ def test_model_source_repo_id_with_filename_ok() -> None:
         name="good",
         runtimes={
             "rocm": RuntimeConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                 source=ModelSource(repo_id="org/model", filename="model.gguf"),
             )
         },
@@ -176,7 +180,7 @@ def test_model_source_empty_rejected() -> None:
             name="empty",
             runtimes={
                 "rocm": RuntimeConfig(
-                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                    docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                     source=ModelSource(),
                 )
             },
@@ -194,7 +198,7 @@ def test_draft_model_source_must_be_explicit() -> None:
             name="bad_draft",
             runtimes={
                 "rocm": RuntimeConfig(
-                    docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                    docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                     source=ModelSource(local_path=Path("/models/main.gguf")),
                     speculative=SpeculativeConfig(
                         type="draft",
@@ -210,7 +214,7 @@ def test_draft_model_with_local_path_ok() -> None:
         name="good_draft",
         runtimes={
             "rocm": RuntimeConfig(
-                docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
+                docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                 source=ModelSource(local_path=Path("/models/main.gguf")),
                 speculative=SpeculativeConfig(
                     type="draft",
@@ -230,6 +234,56 @@ def test_draft_model_with_local_path_ok() -> None:
 def test_empty_config_valid() -> None:
     config = AppConfig()
     assert config.models == []
+
+
+def test_shared_backend_models_require_backends() -> None:
+    with pytest.raises(ValueError, match="top-level backends must be configured"):
+        AppConfig(
+            models=[
+                ModelConfig(
+                    name="gemma",
+                    source=ModelSource(local_path=Path("/models/main.gguf")),
+                )
+            ]
+        )
+
+
+def test_mixed_legacy_shared_backend_models_require_backends() -> None:
+    with pytest.raises(ValueError, match="top-level backends must be configured"):
+        AppConfig(
+            models=[
+                ModelConfig(
+                    name="legacy",
+                    runtimes={
+                        "rocm": RuntimeConfig(
+                            docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                            source=ModelSource(local_path=Path("/models/main.gguf")),
+                        )
+                    },
+                ),
+                ModelConfig(
+                    name="shared",
+                    source=ModelSource(local_path=Path("/models/other.gguf")),
+                ),
+            ]
+        )
+
+
+def test_shared_backend_model_valid() -> None:
+    config = AppConfig(
+        backends={
+            "rocm": BackendConfig(
+                docker_image="inference-server-llama-rocm:7.2.1-7e50ef7"
+            )
+        },
+        models=[
+            ModelConfig(
+                name="gemma",
+                source=ModelSource(local_path=Path("/models/main.gguf")),
+            )
+        ],
+    )
+    assert config.models[0].source is not None
 
 
 # ---------------------------------------------------------------------------
@@ -271,3 +325,143 @@ def test_nested_unknown_fields_rejected() -> None:
                 "unknown_field": "val",
             }
         )
+
+
+def test_mixed_legacy_shared_backend_shape_rejected() -> None:
+    # 1. runtimes + source
+    with pytest.raises(ValidationError, match="cannot mix legacy and new shared-backend shapes: found 'runtimes' alongside top-level field\\(s\\) source"):
+        ModelConfig.model_validate(
+            {
+                "name": "mixed-1",
+                "runtimes": {
+                    "rocm": {
+                        "docker_image": "img",
+                        "source": {"local_path": "/ok.gguf"},
+                    }
+                },
+                "source": {"local_path": "/ok.gguf"},
+            }
+        )
+
+    # 2. runtimes + extra_args (non-empty)
+    with pytest.raises(ValidationError, match="cannot mix legacy and new shared-backend shapes: found 'runtimes' alongside top-level field\\(s\\) extra_args"):
+        ModelConfig.model_validate(
+            {
+                "name": "mixed-2",
+                "runtimes": {
+                    "rocm": {
+                        "docker_image": "img",
+                        "source": {"local_path": "/ok.gguf"},
+                    }
+                },
+                "extra_args": ["--foo"],
+            }
+        )
+
+    # 2b. runtimes + extra_args: []
+    with pytest.raises(ValidationError, match="cannot mix legacy and new shared-backend shapes: found 'runtimes' alongside top-level field\\(s\\) extra_args"):
+        ModelConfig.model_validate(
+            {
+                "name": "mixed-2b",
+                "runtimes": {
+                    "rocm": {
+                        "docker_image": "img",
+                        "source": {"local_path": "/ok.gguf"},
+                    }
+                },
+                "extra_args": [],
+            }
+        )
+
+    # 3. runtimes + non-default speculative
+    with pytest.raises(ValidationError, match="cannot mix legacy and new shared-backend shapes: found 'runtimes' alongside top-level field\\(s\\) speculative"):
+        ModelConfig.model_validate(
+            {
+                "name": "mixed-3",
+                "runtimes": {
+                    "rocm": {
+                        "docker_image": "img",
+                        "source": {"local_path": "/ok.gguf"},
+                    }
+                },
+                "speculative": {"type": "draft-mtp"},
+            }
+        )
+
+    # 3b. runtimes + speculative: {}
+    with pytest.raises(ValidationError, match="cannot mix legacy and new shared-backend shapes: found 'runtimes' alongside top-level field\\(s\\) speculative"):
+        ModelConfig.model_validate(
+            {
+                "name": "mixed-3b",
+                "runtimes": {
+                    "rocm": {
+                        "docker_image": "img",
+                        "source": {"local_path": "/ok.gguf"},
+                    }
+                },
+                "speculative": {},
+            }
+        )
+
+    # 3c. runtimes + speculative: {"type": "none"}
+    with pytest.raises(ValidationError, match="cannot mix legacy and new shared-backend shapes: found 'runtimes' alongside top-level field\\(s\\) speculative"):
+        ModelConfig.model_validate(
+            {
+                "name": "mixed-3c",
+                "runtimes": {
+                    "rocm": {
+                        "docker_image": "img",
+                        "source": {"local_path": "/ok.gguf"},
+                    }
+                },
+                "speculative": {"type": "none"},
+            }
+        )
+
+    # 4. runtimes + multiple top-level fields
+    with pytest.raises(ValidationError, match="cannot mix legacy and new shared-backend shapes: found 'runtimes' alongside top-level field\\(s\\) extra_args, source"):
+        ModelConfig.model_validate(
+            {
+                "name": "mixed-4",
+                "runtimes": {
+                    "rocm": {
+                        "docker_image": "img",
+                        "source": {"local_path": "/ok.gguf"},
+                    }
+                },
+                "source": {"local_path": "/ok.gguf"},
+                "extra_args": ["--foo"],
+            }
+        )
+
+
+def test_valid_legacy_and_new_shapes_pass() -> None:
+    # Legacy shape
+    legacy_cfg = ModelConfig.model_validate(
+        {
+            "name": "legacy",
+            "runtimes": {
+                "rocm": {
+                    "docker_image": "img",
+                    "source": {"local_path": "/ok.gguf"},
+                }
+            },
+        }
+    )
+    assert legacy_cfg.source is None
+    assert legacy_cfg.runtimes["rocm"].source.local_path == Path("/ok.gguf")
+
+    # New shape
+    new_cfg = ModelConfig.model_validate(
+        {
+            "name": "new",
+            "source": {"local_path": "/ok.gguf"},
+            "extra_args": ["--foo"],
+            "speculative": {"type": "draft-mtp"},
+        }
+    )
+    assert not new_cfg.runtimes
+    assert new_cfg.source.local_path == Path("/ok.gguf")
+    assert new_cfg.extra_args == ["--foo"]
+    assert new_cfg.speculative.type == "draft-mtp"
+

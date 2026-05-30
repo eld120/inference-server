@@ -16,11 +16,9 @@ from config import RuntimeSettings
 from manager import ModelRuntimeManager
 from schemas import (
     AppConfig,
-    ModelConfig,
-    ModelSource,
-    RuntimeConfig,
     SpeculativeConfig,
 )
+from tests.helpers import make_app_config, make_backends, make_model
 from tests.test_manager import (
     FakeHF,
     MockDockerClient,
@@ -83,22 +81,17 @@ def _make_config(
 ) -> AppConfig:
     """Create a test AppConfig with optional speculative config."""
     spec = speculative or SpeculativeConfig()
-    return AppConfig(
-        models=[
-            ModelConfig(
-                name="test_model",
-                runtimes={
-                    "rocm": RuntimeConfig(
-                        docker_image="ghcr.io/ggerganov/llama.cpp:server-rocm",
-                        devices=["/dev/kfd", "/dev/dri"],
-                        shared_args=shared_args or [],
-                        source=ModelSource(local_path=tmp_path / "model.gguf"),
-                        speculative=spec,
-                        extra_args=extra_args or [],
-                    )
-                },
-            )
-        ],
+    return make_app_config(
+        make_model(
+            "test_model",
+            tmp_path / "model.gguf",
+            speculative=spec,
+            extra_args=extra_args or [],
+        ),
+        backends=make_backends(
+            rocm_devices=["/dev/kfd", "/dev/dri"],
+            rocm_shared_args=shared_args or [],
+        ),
     )
 
 
@@ -143,7 +136,7 @@ async def test_runtime_uses_image(
     kwargs = await _capture_container_run_kwargs(
         monkeypatch, tmp_path, config, "test_model"
     )
-    assert kwargs["image"] == "ghcr.io/ggerganov/llama.cpp:server-rocm"
+    assert kwargs["image"] == "inference-server-llama-rocm:7.2.1-7e50ef7"
 
 
 @pytest.mark.asyncio
