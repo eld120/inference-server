@@ -11,6 +11,8 @@ Create a `.env` file in the project root if you want to override runtime default
 | `INF_CONFIG_PATH` | Path to `config.json`. Default: `~/.config/inference-server/config.json` |
 | `INF_HOST` | Gateway bind address. Default: `0.0.0.0` |
 | `INF_PORT` | Gateway bind port. Default: `8000` |
+| `INF_MODEL_LOAD_TIMEOUT_SECONDS` | Maximum time to wait for a model to become inference-ready after `/models/load`. Default: `1800` |
+| `INF_MODEL_READINESS_PROBE_TIMEOUT_SECONDS` | Timeout for each readiness probe request sent during model load. Default: `5.0` |
 | `INF_RUNTIME_PORT` | Host port mapped to the active runtime container. Default: `39281` (deprecated alias: `INF_BACKEND_PORT`) |
 | `INF_HF_TOKEN` | Hugging Face token for gated or private models. Also reads `HF_TOKEN` and `HUGGINGFACE_HUB_TOKEN`. |
 
