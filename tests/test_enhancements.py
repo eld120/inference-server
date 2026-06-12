@@ -249,9 +249,11 @@ async def test_vram_safe_swap(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class FakeAppManager:
-    def __init__(self, primary: ModelConfig) -> None:
-        self._primary = primary
-        self.loaded: list[str] = []
+    def __init__(self, *models: ModelConfig) -> None:
+        if not models:
+            raise ValueError("at least one model must be provided")
+        self._models = {model.name: model for model in models}
+        self.loaded: list[tuple[str, str]] = []
         self._active: str | None = None
 
     def status(self) -> SimpleNamespace:
@@ -265,26 +267,27 @@ class FakeAppManager:
     def active_model(self) -> SimpleNamespace | None:
         if self._active is None:
             return None
-        return SimpleNamespace(config=self._primary)
+        return SimpleNamespace(config=self._models[self._active])
 
     async def load(self, name: str, runtime: str = "rocm") -> SimpleNamespace:
-        self.loaded.append(name)
+        assert name in self._models
+        self.loaded.append((name, runtime))
         self._active = name
         return SimpleNamespace(model_dump=lambda: {})
 
     def find_model_for_name(self, model_name: str) -> str | None:
-        if model_name == self._primary.name:
-            return self._primary.name
+        if model_name in self._models:
+            return model_name
         return None
 
     def model_resource(self, name: str) -> SimpleNamespace:
-        state = "running" if name in self.loaded else "stopped"
+        state = "running" if self._active == name else "stopped"
         return SimpleNamespace(
             status=SimpleNamespace(state=state, name=name)
         )
 
     def models(self) -> list[ModelConfig]:
-        return [self._primary]
+        return list(self._models.values())
 
     async def get_logs(self, name: str) -> list[str]:
         return ["log line"]
@@ -307,7 +310,7 @@ class FakeAppManager:
 
 
 @pytest.mark.asyncio
-async def test_app_strict_mismatch_and_explicit_load() -> None:
+async def test_app_auto_switches_requested_model() -> None:
     primary = ModelConfig(
         name="gemma",
         runtimes={
@@ -317,10 +320,23 @@ async def test_app_strict_mismatch_and_explicit_load() -> None:
             )
         },
     )
-    app_config = AppConfig(
-        models=[primary],
+    secondary = ModelConfig(
+        name="qwen",
+        runtimes={
+            "vulkan": RuntimeConfig(
+                docker_image="inference-server-llama-vulkan:26.04-7e50ef7",
+                source=ModelSource(local_path=Path("mock-qwen.gguf")),
+            ),
+            "rocm": RuntimeConfig(
+                docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                source=ModelSource(local_path=Path("mock-qwen.gguf")),
+            ),
+        },
     )
-    fake_manager = FakeAppManager(primary)
+    app_config = AppConfig(
+        models=[primary, secondary],
+    )
+    fake_manager = FakeAppManager(primary, secondary)
 
     app = create_app(
         app_config=app_config,
@@ -330,22 +346,29 @@ async def test_app_strict_mismatch_and_explicit_load() -> None:
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
-        # 1. Initially nothing is loaded, so request should fail with 400
+        # 1. The first request should auto-load the requested model.
         response = await client.post(
-            "/api/v1/chat/completions", json={"model": "gemma"}
+            "/api/v1/chat/completions", json={"model": "qwen"}
         )
-        assert response.status_code == 400
-        assert "not currently loaded" in response.json()["detail"]
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        assert fake_manager.loaded == [("qwen", "vulkan")]
 
-        # 2. Explicitly load the model via the load endpoint
-        await fake_manager.load("gemma", "rocm")
+        # 2. A second request for the same model should not reload it.
+        response = await client.post(
+            "/api/v1/chat/completions", json={"model": "qwen"}
+        )
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        assert fake_manager.loaded == [("qwen", "vulkan")]
 
-        # 3. Now request should succeed with 200
+        # 3. A request for another configured model should switch again.
         response = await client.post(
             "/api/v1/chat/completions", json={"model": "gemma"}
         )
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
+        assert fake_manager.loaded == [("qwen", "vulkan"), ("gemma", "rocm")]
 
 
 @pytest.mark.asyncio
@@ -425,14 +448,15 @@ async def test_container_spawn_failure_sets_error_state(
         await manager.load("gemma", "rocm")
 
     status = manager.status()
-    gemma_status = next(b for b in status.models if b.name == "gemma")
-    assert gemma_status.state == "error"
-    assert gemma_status.last_error is not None
-    assert "failed to create container" in gemma_status.last_error
+    gemma_status = manager.model_resource("gemma").status
+    assert gemma_status.state == "stopped"
+    assert gemma_status.last_error is None
+    assert status.last_error is not None
+    assert "failed to create container" in status.last_error
 
 
 @pytest.mark.asyncio
-async def test_resolver_failure_sets_error_state(
+async def test_resolver_failure_leaves_previous_state_intact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mock_client = MockDockerClient()
@@ -474,10 +498,10 @@ async def test_resolver_failure_sets_error_state(
         await manager.load("gemma", "rocm")
 
     status = manager.status()
-    gemma_status = next(b for b in status.models if b.name == "gemma")
-    assert gemma_status.state == "error"
-    assert gemma_status.last_error is not None
-    assert "download failed" in gemma_status.last_error
+    gemma_status = manager.model_resource("gemma").status
+    assert gemma_status.state == "stopped"
+    assert gemma_status.last_error is None
+    assert status.active_model is None
 
 
 @pytest.mark.asyncio
@@ -528,10 +552,11 @@ async def test_container_boot_crash_sets_error_state(
         await manager.load("gemma", "rocm")
 
     status = manager.status()
-    gemma_status = next(b for b in status.models if b.name == "gemma")
-    assert gemma_status.state == "error"
-    assert gemma_status.last_error is not None
-    assert "Container exited immediately" in gemma_status.last_error
+    gemma_status = manager.model_resource("gemma").status
+    assert gemma_status.state == "stopped"
+    assert gemma_status.last_error is None
+    assert status.last_error is not None
+    assert "Container exited immediately" in status.last_error
 
 
 class MockDockerClient:

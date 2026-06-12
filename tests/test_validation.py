@@ -187,6 +187,36 @@ def test_model_source_empty_rejected() -> None:
         )
 
 
+def test_legacy_mmproj_extra_args_translate_to_mmproj_field() -> None:
+    config = AppConfig.model_validate(
+        {
+            "backends": {
+                "rocm": {
+                    "docker_image": "inference-server-llama-rocm:7.2.1-7e50ef7",
+                }
+            },
+            "models": [
+                {
+                    "name": "vision",
+                    "source": {
+                        "repo_id": "org/model",
+                        "filename": "model.gguf",
+                    },
+                    "extra_args": ["--mmproj", "mmproj-BF16.gguf", "--temp", "0.7"],
+                }
+            ],
+        }
+    )
+
+    model = config.models[0]
+    assert model.mmproj == ModelSource(
+        repo_id="org/model",
+        filename="mmproj-BF16.gguf",
+        revision="main",
+    )
+    assert model.extra_args == ["--temp", "0.7"]
+
+
 # ---------------------------------------------------------------------------
 # AppConfig validation: draft model source must also be explicit
 # ---------------------------------------------------------------------------
@@ -464,4 +494,153 @@ def test_valid_legacy_and_new_shapes_pass() -> None:
     assert new_cfg.source.local_path == Path("/ok.gguf")
     assert new_cfg.extra_args == ["--foo"]
     assert new_cfg.speculative.type == "draft-mtp"
+
+
+# ---------------------------------------------------------------------------
+# mmproj validation tests
+# ---------------------------------------------------------------------------
+
+
+def test_valid_structured_mmproj_local_path() -> None:
+    # Top-level legacy shape
+    cfg = ModelConfig.model_validate(
+        {
+            "name": "model_local_mmproj",
+            "source": {"local_path": "/path/to/model.gguf"},
+            "mmproj": {"local_path": "/path/to/mmproj.gguf"},
+        }
+    )
+    assert cfg.mmproj is not None
+    assert cfg.mmproj.local_path == Path("/path/to/mmproj.gguf")
+
+    # Runtime-based shape
+    cfg_rt = ModelConfig.model_validate(
+        {
+            "name": "model_local_mmproj_rt",
+            "runtimes": {
+                "rocm": {
+                    "docker_image": "img",
+                    "source": {"local_path": "/path/to/model.gguf"},
+                    "mmproj": {"local_path": "/path/to/mmproj.gguf"},
+                }
+            },
+        }
+    )
+    assert cfg_rt.runtimes["rocm"].mmproj is not None
+    assert cfg_rt.runtimes["rocm"].mmproj.local_path == Path("/path/to/mmproj.gguf")
+
+
+def test_valid_structured_mmproj_repo_and_filename() -> None:
+    # Top-level legacy shape
+    cfg = ModelConfig.model_validate(
+        {
+            "name": "model_repo_mmproj",
+            "source": {"local_path": "/path/to/model.gguf"},
+            "mmproj": {"repo_id": "org/model", "filename": "mmproj.gguf"},
+        }
+    )
+    assert cfg.mmproj is not None
+    assert cfg.mmproj.repo_id == "org/model"
+    assert cfg.mmproj.filename == "mmproj.gguf"
+
+    # Runtime-based shape
+    cfg_rt = ModelConfig.model_validate(
+        {
+            "name": "model_repo_mmproj_rt",
+            "runtimes": {
+                "rocm": {
+                    "docker_image": "img",
+                    "source": {"local_path": "/path/to/model.gguf"},
+                    "mmproj": {"repo_id": "org/model", "filename": "mmproj.gguf"},
+                }
+            },
+        }
+    )
+    assert cfg_rt.runtimes["rocm"].mmproj is not None
+    assert cfg_rt.runtimes["rocm"].mmproj.repo_id == "org/model"
+    assert cfg_rt.runtimes["rocm"].mmproj.filename == "mmproj.gguf"
+
+
+def test_invalid_structured_mmproj_only_repo_id() -> None:
+    # Top-level legacy shape
+    with pytest.raises(ValidationError) as exc_info:
+        ModelConfig.model_validate(
+            {
+                "name": "model_invalid_repo_only",
+                "source": {"local_path": "/path/to/model.gguf"},
+                "mmproj": {"repo_id": "org/model"},
+            }
+        )
+    assert "mmproj source must specify local_path" in str(exc_info.value)
+
+    # Runtime-based shape
+    with pytest.raises(ValidationError) as exc_info_rt:
+        ModelConfig.model_validate(
+            {
+                "name": "model_invalid_repo_only_rt",
+                "runtimes": {
+                    "rocm": {
+                        "docker_image": "img",
+                        "source": {"local_path": "/path/to/model.gguf"},
+                        "mmproj": {"repo_id": "org/model"},
+                    }
+                },
+            }
+        )
+    assert "mmproj source must specify local_path" in str(exc_info_rt.value)
+
+
+def test_invalid_structured_mmproj_only_filename() -> None:
+    # Top-level legacy shape
+    with pytest.raises(ValidationError) as exc_info:
+        ModelConfig.model_validate(
+            {
+                "name": "model_invalid_file_only",
+                "source": {"local_path": "/path/to/model.gguf"},
+                "mmproj": {"filename": "mmproj.gguf"},
+            }
+        )
+    assert "mmproj source must specify local_path" in str(exc_info.value)
+
+    # Runtime-based shape
+    with pytest.raises(ValidationError) as exc_info_rt:
+        ModelConfig.model_validate(
+            {
+                "name": "model_invalid_file_only_rt",
+                "runtimes": {
+                    "rocm": {
+                        "docker_image": "img",
+                        "source": {"local_path": "/path/to/model.gguf"},
+                        "mmproj": {"filename": "mmproj.gguf"},
+                    }
+                },
+            }
+        )
+    assert "mmproj source must specify local_path" in str(exc_info_rt.value)
+
+
+def test_legacy_mmproj_normalization() -> None:
+    # With local source
+    cfg_local = ModelConfig.model_validate(
+        {
+            "name": "model_legacy_local",
+            "source": {"local_path": "/path/to/model.gguf"},
+            "extra_args": ["--mmproj", "mmproj.gguf", "--other"],
+        }
+    )
+    assert cfg_local.mmproj is not None
+    assert cfg_local.mmproj.local_path == Path("/path/to/mmproj.gguf")
+    assert cfg_local.extra_args == ["--other"]
+
+    # With repo source
+    cfg_repo = ModelConfig.model_validate(
+        {
+            "name": "model_legacy_repo",
+            "source": {"repo_id": "org/model", "filename": "model.gguf"},
+            "extra_args": ["--mmproj=mmproj.gguf"],
+        }
+    )
+    assert cfg_repo.mmproj is not None
+    assert cfg_repo.mmproj.repo_id == "org/model"
+    assert cfg_repo.mmproj.filename == "mmproj.gguf"
 

@@ -73,24 +73,23 @@ async def test_swap_failure_rollback(
 
     monkeypatch.setattr(RuntimeContainer, "load_model", failing_load)
 
-    # Attempt to swap to model_b; should raise RuntimeError and move to error state
+    # Attempt to swap to model_b; should raise RuntimeError and leave the manager clean.
     with pytest.raises(RuntimeError, match="Forced load failure"):
         await manager.load("model_b", "rocm")
 
-    # Assert active model name is cleared since model_a was unloaded,
-    # and runtime config points to model_b (which failed) in error state.
+    # The previous runtime is gone and the failed replacement is discarded.
     assert manager._active_model_name is None
-    assert manager._active_runtime is not None
-    assert manager._active_runtime.model_name == "model_b"
-    assert manager._active_runtime.state == "error"
+    assert manager._active_runtime is None
 
     # Status checks
+    service_status = manager.status()
     statuses = {s.name: s for s in manager.model_statuses()}
     assert statuses["model_a"].state == "stopped"
     assert statuses["model_a"].active is False
-    assert statuses["model_b"].state == "error"
+    assert statuses["model_b"].state == "stopped"
     assert statuses["model_b"].active is False
-    assert "Forced load failure" in (statuses["model_b"].last_error or "")
+    assert statuses["model_b"].last_error is None
+    assert "Forced load failure" in (service_status.last_error or "")
 
 
 @pytest.mark.asyncio

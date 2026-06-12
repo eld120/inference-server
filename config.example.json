@@ -71,10 +71,11 @@
         "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
         "revision": "main"
       },
-      "extra_args": [
-        "--mmproj",
-        "mmproj-BF16.gguf"
-      ]
+      "mmproj": {
+        "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
+        "filename": "mmproj-BF16.gguf",
+        "revision": "main"
+      }
     },
     {
       "name": "qwen3.6-27b-vision-mtp-example",
@@ -83,9 +84,12 @@
         "filename": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
         "revision": "main"
       },
+      "mmproj": {
+        "repo_id": "unsloth/Qwen3.6-27B-MTP-GGUF",
+        "filename": "mmproj-BF16.gguf",
+        "revision": "main"
+      },
       "extra_args": [
-        "--mmproj",
-        "mmproj-BF16.gguf",
         "--spec-draft-n-max",
         "2"
       ],
@@ -107,6 +111,32 @@
           "filename": "gemma-4-31b-it-assistant-Q4_K_M.gguf",
           "revision": "main"
         }
+      }
+    },
+    {
+      "name": "gemma-4-26b-q4-vision",
+      "source": {
+        "repo_id": "batiai/Gemma-4-26B-A4B-it-GGUF",
+        "filename": "google-gemma-4-26B-A4B-it-IQ4_XS.gguf",
+        "revision": "main"
+      },
+      "mmproj": {
+        "repo_id": "batiai/Gemma-4-26B-A4B-it-GGUF",
+        "filename": "mmproj-Q6_K.gguf",
+        "revision": "main"
+      }
+    },
+    {
+      "name": "gemma-4-31b-q4-vision",
+      "source": {
+        "repo_id": "ebircak/gemma-4-31B-it-GGUF",
+        "filename": "gemma-4-31B-it-IQ4_NL_M_AMD.gguf",
+        "revision": "main"
+      },
+      "mmproj": {
+        "repo_id": "ebircak/gemma-4-31B-it-GGUF",
+        "filename": "mmproj-gemma-4-31B-it-q8_0.gguf",
+        "revision": "main"
       }
     }
   ]

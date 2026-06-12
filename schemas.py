@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -56,6 +56,52 @@ class ModelSource(BaseModel):
         return "unconfigured"
 
 
+def _legacy_mmproj_source(
+    base_source: ModelSource | None,
+    filename: str,
+) -> ModelSource | None:
+    if base_source is None:
+        return None
+    if base_source.repo_id is not None:
+        return ModelSource(
+            repo_id=base_source.repo_id,
+            filename=filename,
+            revision=base_source.revision,
+        )
+    if base_source.local_path is not None:
+        return ModelSource(local_path=base_source.local_path.parent / filename)
+    return ModelSource(local_path=Path(filename))
+
+
+def _normalize_mmproj_args(
+    extra_args: list[str],
+    base_source: ModelSource | None,
+    current_mmproj: ModelSource | None = None,
+) -> tuple[list[str], ModelSource | None]:
+    cleaned: list[str] = []
+    mmproj_source = current_mmproj
+
+    i = 0
+    while i < len(extra_args):
+        arg = extra_args[i]
+        if arg == "--mmproj" and i + 1 < len(extra_args):
+            candidate = _legacy_mmproj_source(base_source, extra_args[i + 1])
+            if candidate is not None:
+                mmproj_source = candidate
+            i += 2
+            continue
+        if arg.startswith("--mmproj="):
+            candidate = _legacy_mmproj_source(base_source, arg.split("=", 1)[1])
+            if candidate is not None:
+                mmproj_source = candidate
+            i += 1
+            continue
+        cleaned.append(arg)
+        i += 1
+
+    return cleaned, mmproj_source
+
+
 # Speculative types that require a separate draft model
 _DRAFT_MODEL_TYPES: set[SpeculativeType] = {"draft", "draft-simple"}
 
@@ -94,13 +140,30 @@ class RuntimeConfig(BaseModel):
     devices: list[str] = Field(default_factory=list)
     volumes: dict[str, str] = Field(default_factory=dict)
     shared_args: list[str] = Field(default_factory=list)
+    mmproj: ModelSource | None = None
     extra_args: list[str] = Field(default_factory=list)
     speculative: SpeculativeConfig = Field(default_factory=SpeculativeConfig)
     bind_host: str = "127.0.0.1"
     connect_host: str = "127.0.0.1"
 
     @model_validator(mode="after")
-    def _validate_speculative_args(self) -> RuntimeConfig:
+    def _normalize_legacy_fields(self) -> RuntimeConfig:
+        self.extra_args, legacy_mmproj = _normalize_mmproj_args(
+            self.extra_args,
+            self.source,
+            self.mmproj,
+        )
+        if self.mmproj is None:
+            self.mmproj = legacy_mmproj
+
+        if self.mmproj is not None:
+            if self.mmproj.local_path is None:
+                if self.mmproj.repo_id is None or self.mmproj.filename is None:
+                    raise ValueError(
+                        "mmproj source must specify local_path, "
+                        "or both repo_id and filename"
+                    )
+
         for arg in self.extra_args:
             if arg == "--spec-type" or arg.startswith("--spec-type="):
                 raise ValueError(
@@ -126,6 +189,7 @@ class ModelConfig(BaseModel):
 
     name: str
     source: ModelSource | None = None
+    mmproj: ModelSource | None = None
     extra_args: list[str] = Field(default_factory=list)
     speculative: SpeculativeConfig = Field(default_factory=SpeculativeConfig)
     runtimes: dict[Literal["rocm", "vulkan"], RuntimeConfig] = Field(
@@ -139,7 +203,9 @@ class ModelConfig(BaseModel):
             runtimes = data.get("runtimes")
             if runtimes:  # runtimes is present and non-empty
                 forbidden = [
-                    f for f in ("source", "extra_args", "speculative") if f in data
+                    f
+                    for f in ("source", "mmproj", "extra_args", "speculative")
+                    if f in data
                 ]
                 if forbidden:
                     name = data.get("name", "unnamed")
@@ -151,13 +217,6 @@ class ModelConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_runtimes(self) -> ModelConfig:
-        for arg in self.extra_args:
-            if arg == "--spec-type" or arg.startswith("--spec-type="):
-                raise ValueError(
-                    "do not specify '--spec-type' in extra_args; "
-                    "use the structured 'speculative' configuration field instead"
-                )
-
         if self.runtimes:
             for rt_name, rt_cfg in self.runtimes.items():
                 src = rt_cfg.source
@@ -178,7 +237,39 @@ class ModelConfig(BaseModel):
                                 "draft_model source must specify local_path, "
                                 "or both repo_id and filename"
                             )
+
+                if rt_cfg.mmproj is not None:
+                    if rt_cfg.mmproj.local_path is None:
+                        if rt_cfg.mmproj.repo_id is None or rt_cfg.mmproj.filename is None:
+                            raise ValueError(
+                                f"model '{self.name}' runtime '{rt_name}': "
+                                "mmproj source must specify local_path, "
+                                "or both repo_id and filename"
+                            )
             return self
+
+        self.extra_args, legacy_mmproj = _normalize_mmproj_args(
+            self.extra_args,
+            self.source,
+            self.mmproj,
+        )
+        if self.mmproj is None:
+            self.mmproj = legacy_mmproj
+
+        if self.mmproj is not None:
+            if self.mmproj.local_path is None:
+                if self.mmproj.repo_id is None or self.mmproj.filename is None:
+                    raise ValueError(
+                        f"model '{self.name}': mmproj source must specify local_path, "
+                        "or both repo_id and filename"
+                    )
+
+        for arg in self.extra_args:
+            if arg == "--spec-type" or arg.startswith("--spec-type="):
+                raise ValueError(
+                    "do not specify '--spec-type' in extra_args; "
+                    "use the structured 'speculative' configuration field instead"
+                )
 
         if self.source is None:
             raise ValueError(
@@ -360,7 +451,6 @@ class ServiceStatus(BaseModel):
     active_runtime: str | None = None
     active_container_id: str | None = None
     last_error: str | None = None
-    models: list[ModelResource]
 
 
 class HFSearchResult(BaseModel):

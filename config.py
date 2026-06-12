@@ -13,10 +13,15 @@ def default_config_path() -> Path:
     return Path.home() / ".config" / "inference-server" / "config.json"
 
 
+def default_runtime_log_dir() -> Path:
+    return Path.home() / ".local" / "state" / "inference-server" / "logs"
+
+
 class RuntimeSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="INF_", extra="ignore")
 
     config_path: Path = Field(default_factory=default_config_path)
+    runtime_log_dir: Path = Field(default_factory=default_runtime_log_dir)
     host: str = "0.0.0.0"
     port: int = 8000
     model_load_timeout_seconds: int = 1800
@@ -31,6 +36,12 @@ class RuntimeSettings(BaseSettings):
         default=None,
         validation_alias=AliasChoices(
             "INF_HF_TOKEN", "HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"
+        ),
+    )
+    observability_db_path: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "INF_OBSERVABILITY_DB_PATH", "OBSERVABILITY_DB_PATH"
         ),
     )
 
@@ -50,6 +61,13 @@ def load_app_config(path: Path) -> AppConfig:
                 m.source.local_path = (config_dir / lp).resolve().absolute()
             else:
                 m.source.local_path = lp.resolve().absolute()
+        if m.mmproj is not None and m.mmproj.local_path is not None:
+            lp = m.mmproj.local_path
+            if not lp.is_absolute():
+                m.mmproj._original_local_path_is_relative = True
+                m.mmproj.local_path = (config_dir / lp).resolve().absolute()
+            else:
+                m.mmproj.local_path = lp.resolve().absolute()
         if m.speculative.draft_model is not None and m.speculative.draft_model.local_path is not None:
             lp = m.speculative.draft_model.local_path
             if not lp.is_absolute():
@@ -66,6 +84,13 @@ def load_app_config(path: Path) -> AppConfig:
                     rt.source.local_path = (config_dir / lp).resolve().absolute()
                 else:
                     rt.source.local_path = lp.resolve().absolute()
+            if rt.mmproj is not None and rt.mmproj.local_path is not None:
+                lp = rt.mmproj.local_path
+                if not lp.is_absolute():
+                    rt.mmproj._original_local_path_is_relative = True
+                    rt.mmproj.local_path = (config_dir / lp).resolve().absolute()
+                else:
+                    rt.mmproj.local_path = lp.resolve().absolute()
             if (
                 rt.speculative.draft_model is not None
                 and rt.speculative.draft_model.local_path is not None
@@ -93,6 +118,12 @@ def save_app_config(path: Path, config: AppConfig) -> None:
                 lp = m.source.local_path.resolve().absolute()
                 import os
                 m.source.local_path = Path(os.path.relpath(lp, config_dir))
+        if m.mmproj is not None and m.mmproj.local_path is not None:
+            is_rel = getattr(orig_model.mmproj, "_original_local_path_is_relative", False)
+            if is_rel:
+                lp = m.mmproj.local_path.resolve().absolute()
+                import os
+                m.mmproj.local_path = Path(os.path.relpath(lp, config_dir))
         if m.speculative.draft_model is not None and m.speculative.draft_model.local_path is not None:
             is_rel = getattr(
                 orig_model.speculative.draft_model,
@@ -111,6 +142,12 @@ def save_app_config(path: Path, config: AppConfig) -> None:
                     lp = rt.source.local_path.resolve().absolute()
                     import os
                     rt.source.local_path = Path(os.path.relpath(lp, config_dir))
+            if rt.mmproj is not None and rt.mmproj.local_path is not None:
+                is_rel = getattr(orig_rt.mmproj, "_original_local_path_is_relative", False)
+                if is_rel:
+                    lp = rt.mmproj.local_path.resolve().absolute()
+                    import os
+                    rt.mmproj.local_path = Path(os.path.relpath(lp, config_dir))
             if (
                 rt.speculative.draft_model is not None
                 and rt.speculative.draft_model.local_path is not None
