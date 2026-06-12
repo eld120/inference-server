@@ -22,6 +22,7 @@ from schemas import (
     HealthResponse,
     LoadModelRequest,
     LogsResponse,
+    ModelConfig,
     ModelResource,
     ModelsResponse,
     OpenAIModelListResponse,
@@ -65,6 +66,31 @@ def _manager_active_model(manager: ModelRuntimeManagerProtocol):
 
 def _manager_find_model(manager: ModelRuntimeManagerProtocol, model_name: str) -> str | None:
     return manager.find_model_for_name(model_name)
+
+
+def _manager_find_model_config(
+    manager: ModelRuntimeManagerProtocol,
+    model_name: str,
+) -> ModelConfig | None:
+    for model in manager.models():
+        if model.name == model_name:
+            return model
+    return None
+
+
+def _preferred_runtime_for_model(
+    manager: ModelRuntimeManagerProtocol,
+    app_config: AppConfig,
+    model_name: str,
+) -> str | None:
+    model_config = _manager_find_model_config(manager, model_name)
+    if model_config is None:
+        return None
+    if model_config.runtimes:
+        return next(iter(model_config.runtimes))
+    if app_config.backends:
+        return next(iter(app_config.backends))
+    return None
 
 
 async def increment_inflight_requests(app: FastAPI) -> None:
@@ -138,11 +164,12 @@ def create_app(
         token=effective_hf_token(runtime, app_config),
     )
     manager = manager or ModelRuntimeManager(runtime=runtime, app_config=app_config, hf=hf)
+    db_path = observability_db_path or runtime.observability_db_path
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from observability import ObservabilityDB, start_telemetry_logger
-        db = ObservabilityDB(db_path=observability_db_path)
+        db = ObservabilityDB(db_path=db_path)
         app.state.observability_db = db
         polling_task = asyncio.create_task(
             start_telemetry_logger(db, app.state.observability_tasks, interval_seconds=30)
@@ -220,8 +247,15 @@ def create_app(
 
     @app.post(f"{api_prefix}/models/{{name}}/load", response_model=ModelResource)
     async def load_model(name: str, body: LoadModelRequest) -> ModelResource:
+        load_task = asyncio.create_task(manager.load(name, body.runtime))
         try:
-            status = await manager.load(name, body.runtime)
+            status = await asyncio.shield(load_task)
+        except asyncio.CancelledError:
+            logger.warning(
+                "Client disconnected while loading model %s; load continues in background.",
+                name,
+            )
+            raise
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -237,10 +271,7 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         if status is None:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Model '{name}' is not currently active.",
-            )
+            raise HTTPException(status_code=400, detail="No model is currently active.")
         return status
 
     @app.get(f"{api_prefix}/models/{{name}}/logs", response_model=LogsResponse)
@@ -290,15 +321,25 @@ def create_app(
                         detail=f"Model '{target_model}' is still loading.",
                     )
 
-                # Verify configured model matches currently loaded model
                 if active is None or active.config.name != target_model:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"Model '{model_name}' is not currently loaded. "
-                            "Please call the load endpoint first."
-                        ),
-                    )
+                    runtime = _preferred_runtime_for_model(manager, app_config, target_model)
+                    if runtime is None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Model '{target_model}' has no configured runtime.",
+                        )
+                    load_task = asyncio.create_task(manager.load(target_model, runtime))
+                    try:
+                        await asyncio.shield(load_task)
+                    except asyncio.CancelledError:
+                        raise
+                    except KeyError as exc:
+                        raise HTTPException(status_code=404, detail=str(exc)) from exc
+                    except ValueError as exc:
+                        raise HTTPException(status_code=400, detail=str(exc)) from exc
+                    except Exception as exc:  # noqa: BLE001
+                        raise HTTPException(status_code=500, detail=str(exc)) from exc
+                    active = _manager_active_model(manager)
             else:
                 # No model specified: check if any model is loaded
                 starting_models = [
@@ -360,6 +401,9 @@ def create_app(
                     try:
                         async for chunk in upstream_response.aiter_raw():
                             yield chunk
+                    except Exception as exc:
+                        await manager.handle_runtime_communication_failure(exc)
+                        raise
                     finally:
                         try:
                             await asyncio.shield(upstream_response.aclose())
@@ -383,6 +427,12 @@ def create_app(
                     headers=headers,
                     media_type=content_type or None,
                 )
+            except Exception as exc:
+                await manager.handle_runtime_communication_failure(exc)
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Model runtime communication failure: {exc}",
+                ) from exc
             finally:
                 try:
                     await asyncio.shield(upstream_response.aclose())
