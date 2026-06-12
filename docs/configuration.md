@@ -14,6 +14,7 @@ Create a `.env` file in the project root if you want to override runtime default
 | `INF_MODEL_LOAD_TIMEOUT_SECONDS` | Maximum time to wait for a model to become inference-ready after `/models/load`. Default: `1800` |
 | `INF_MODEL_READINESS_PROBE_TIMEOUT_SECONDS` | Timeout for each readiness probe request sent during model load. Default: `5.0` |
 | `INF_RUNTIME_PORT` | Host port mapped to the active runtime container. Default: `39281` (deprecated alias: `INF_BACKEND_PORT`) |
+| `INF_RUNTIME_LOG_DIR` | Directory where runtime/container log snapshots are appended to daily files. Default: `~/.local/state/inference-server/logs` |
 | `INF_HF_TOKEN` | Hugging Face token for gated or private models. Also reads `HF_TOKEN` and `HUGGINGFACE_HUB_TOKEN`. |
 
 ## Config File
@@ -40,6 +41,7 @@ Each model must have a unique `name`. In the preferred format, models define onl
 |---|---|---|
 | `name` | `string` | Canonical model name/key used by clients (e.g. `gemma`, `qwen`). |
 | `source` | `object` | Model source info (see below). |
+| `mmproj` | `object \| null` | `null` | Optional multimodal projector source (same structure as `source`). |
 | `extra_args` | `string[]` | Model-specific llama.cpp arguments. |
 | `speculative` | `object` | Optional speculative decoding configuration. |
 
@@ -51,6 +53,8 @@ Legacy compatibility:
 ## Backend Configurations
 
 Each backend block specifies the shared container/runtime details for a hardware backend.
+
+These backend definitions are reused as configuration templates, but the runtime container itself is ephemeral: each successful `load` creates a fresh container, and `unload` tears that container down.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -95,10 +99,11 @@ Supported speculative types:
 
 ### Multimodal / Vision Models
 
-When running multimodal models that require a vision projection adapter (like Qwen 3.6 VL), configure the main model as the `source` and add the `--mmproj` flag to `extra_args`:
+When running multimodal models that require a vision projection adapter (like Qwen 3.6 VL), configure the main model as the `source` and the projector as `mmproj`:
 
-* Format: `["--mmproj", "mmproj-BF16.gguf"]` (or target projector filename).
-* The orchestrator will automatically resolve and download the projector file from Hugging Face (assuming it resides in the same repository as the base model), and map its location into the container path correctly.
+* Format: the same `ModelSource` shape as `source`, usually with the same `repo_id` and a projector `filename`.
+* The orchestrator resolves and downloads the projector before starting the runtime, then maps its location into the container path correctly.
+* Legacy `--mmproj` entries in `extra_args` are still accepted for compatibility, but `mmproj` is the canonical field.
 
 ### Disk I/O & Memory Optimizations (HDD / VRAM Balance)
 

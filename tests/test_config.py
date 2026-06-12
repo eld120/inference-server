@@ -19,6 +19,7 @@ def test_app_config_round_trip(tmp_path: Path) -> None:
                         docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
                         devices=["/dev/kfd", "/dev/dri"],
                         source=ModelSource(local_path=tmp_path / "model.gguf"),
+                        mmproj=ModelSource(local_path=tmp_path / "mmproj.gguf"),
                     )
                 },
             )
@@ -38,6 +39,9 @@ def test_app_config_round_trip(tmp_path: Path) -> None:
     assert (
         loaded.models[0].runtimes["rocm"].source.local_path == tmp_path / "model.gguf"
     )
+    assert (
+        loaded.models[0].runtimes["rocm"].mmproj.local_path == tmp_path / "mmproj.gguf"
+    )
 
 
 def test_runtime_settings_hf_token(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -56,12 +60,28 @@ def test_runtime_settings_model_load_timeout_default() -> None:
     assert settings.model_load_timeout_seconds == 1800
 
 
+def test_runtime_settings_runtime_log_dir_default() -> None:
+    settings = RuntimeSettings()
+    assert settings.runtime_log_dir == (
+        Path.home() / ".local" / "state" / "inference-server" / "logs"
+    )
+
+
 def test_runtime_settings_model_load_timeout_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("INF_MODEL_LOAD_TIMEOUT_SECONDS", "2400")
     settings = RuntimeSettings()
     assert settings.model_load_timeout_seconds == 2400
+
+
+def test_runtime_settings_runtime_log_dir_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("INF_RUNTIME_LOG_DIR", str(tmp_path / "runtime-logs"))
+    settings = RuntimeSettings()
+    assert settings.runtime_log_dir == tmp_path / "runtime-logs"
 
 
 def test_runtime_settings_model_readiness_probe_timeout_default() -> None:

@@ -1,8 +1,8 @@
 ARG UBUNTU_VERSION=24.04
 
 # This needs to generally match the container host's environment.
-ARG ROCM_VERSION=7.2.1
-ARG AMDGPU_VERSION=7.2.1
+ARG ROCM_VERSION=7.2.4
+ARG AMDGPU_VERSION=7.2.4
 ARG LLAMA_CPP_REPO=https://github.com/ggml-org/llama.cpp.git
 ARG LLAMA_CPP_COMMIT=7e50ef7d79f7fb5f957e378111f7cf38c0929d46
 

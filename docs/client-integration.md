@@ -10,8 +10,6 @@ client = OpenAI(
     api_key="not-needed",
 )
 
-# Load the model first (specifying rocm/vulkan runtime in the JSON body):
-# POST http://localhost:8000/api/models/gemma/load {"runtime": "rocm"}
 response = client.chat.completions.create(
     model="gemma",
     messages=[{"role": "user", "content": "Explain gravity in one sentence."}],
@@ -34,3 +32,9 @@ curl http://localhost:8000/api/v1/chat/completions \
     "stream": true
   }'
 ```
+
+If `gemma` is not already active, the server loads it automatically before proxying the request.
+
+If you want to pre-warm a model explicitly, you can still call `POST /api/models/{name}/load` first.
+
+If a proxy request returns `503` because runtime communication failed, call `load` again before retrying.

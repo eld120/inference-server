@@ -1502,3 +1502,55 @@ async def test_telemetry_retry_shutdown(tmp_path):
     assert sessions[0]["end_time"] is not None
 
 
+def test_observability_db_default_path_non_test(tmp_path):
+    import sys
+    had_pytest = "pytest" in sys.modules
+    pytest_module = sys.modules.get("pytest")
+    if had_pytest:
+        del sys.modules["pytest"]
+    try:
+        source_dir = Path.home() / ".config" / "inference-server"
+        expected_path = source_dir / "observability.db"
+        db = ObservabilityDB()
+        try:
+            assert db.db_path == expected_path
+            assert db.db_path.is_relative_to(source_dir)
+            assert db.db_path.exists()
+            with db._connection() as conn:
+                conn.execute("CREATE TABLE IF NOT EXISTS test_write (val TEXT)")
+                conn.execute("INSERT INTO test_write (val) VALUES ('hello')")
+                conn.commit()
+                res = conn.execute("SELECT val FROM test_write").fetchone()
+                assert res["val"] == "hello"
+        finally:
+            try:
+                with db._connection() as conn:
+                    conn.execute("DROP TABLE IF EXISTS test_write")
+                    conn.commit()
+            except Exception:
+                pass
+            db.close()
+    finally:
+        if had_pytest:
+            sys.modules["pytest"] = pytest_module
+
+
+def test_observability_db_env_override(tmp_path):
+    import os
+    from unittest.mock import patch
+    from config import RuntimeSettings
+    from app import create_app
+
+    custom_db_path = tmp_path / "custom_observability.db"
+    with patch.dict(os.environ, {"INF_OBSERVABILITY_DB_PATH": str(custom_db_path)}):
+        runtime = RuntimeSettings()
+        assert runtime.observability_db_path == custom_db_path
+        
+        db = ObservabilityDB(db_path=runtime.observability_db_path)
+        try:
+            assert db.db_path == custom_db_path
+            assert db.db_path.exists()
+        finally:
+            db.close()
+
+

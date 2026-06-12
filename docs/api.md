@@ -7,7 +7,7 @@ All routes are rooted at `api_prefix`, which defaults to `/api`.
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/api/health` | Minimal health check. Returns `{"ok": true}`. |
-| `GET` | `/api/status` | Rich operator summary showing the configuration path, active model/runtime state, and per-model resources. |
+| `GET` | `/api/status` | Compact operator summary showing configuration path, active model/runtime state, and the last service/runtime error. |
 
 ---
 
@@ -17,9 +17,9 @@ All routes are rooted at `api_prefix`, which defaults to `/api`.
 |---|---|---|
 | `GET` | `/api/models` | List all configured models with their runtime status. |
 | `GET` | `/api/models/{name}` | Return one configured model with its runtime status. |
-| `POST` | `/api/models/{name}/load` | Load a model by name. Requires a JSON body choosing the runtime: `{"runtime": "rocm" | "vulkan"}`. |
-| `POST` | `/api/models/{name}/unload` | Unload the active model. |
-| `GET` | `/api/models/{name}/logs` | Fetch recent container logs for the model's active runtime. |
+| `POST` | `/api/models/{name}/load` | Load a model by name. Requires a JSON body choosing the runtime: `{"runtime": "rocm" | "vulkan"}`. The call blocks until the model is ready to serve requests. |
+| `POST` | `/api/models/{name}/unload` | Unload the active model and tear down its runtime container. |
+| `GET` | `/api/models/{name}/logs` | Fetch recent runtime logs for the model, including the latest persisted failure logs after teardown. |
 
 ### Loading a Model
 
@@ -39,6 +39,12 @@ Or:
 }
 ```
 
+Behavior:
+- The orchestrator always starts a fresh runtime container for the activation attempt.
+- If another model is currently active, its runtime container is stopped and removed before the new one starts.
+- A successful response means the model is ready to accept proxied `/api/v1/*` requests immediately.
+- You do not need to call this endpoint before every inference request if the request already names a configured model. The proxy will activate it on demand.
+
 #### Response Example
 ```json
 {
@@ -46,6 +52,7 @@ Or:
   "config": {
     "name": "gemma",
     "source": { ... },
+    "mmproj": null,
     "extra_args": [],
     "speculative": { "type": "none" }
   },
@@ -63,7 +70,37 @@ Or:
 ```
 
 Legacy note:
-- Older configs may still return `config.runtimes` instead of top-level `source`/`extra_args`/`speculative`.
+- Older configs may still return `config.runtimes` instead of top-level `source`/`mmproj`/`extra_args`/`speculative`.
+
+### Unloading a Model
+
+`POST /api/models/{name}/unload` stops and removes the active runtime container.
+
+Behavior:
+- Returns `200` for any configured model name, even if no model is currently active.
+- If a runtime teardown is already underway in Docker, the API still treats the unload as accepted once the container name is observed to release.
+- Returns `404` only when `{name}` is not a configured model.
+
+After unload:
+- `active_model` becomes `null`.
+- `active_runtime` becomes `null`.
+- `active_container_id` becomes `null`.
+- Requests that omit `model` still return `400` until a model is loaded again.
+
+#### Status Example
+```json
+{
+  "healthy": true,
+  "api_prefix": "/api",
+  "config_path": "/home/user/.config/inference-server/config.json",
+  "active_model": null,
+  "active_runtime": null,
+  "active_container_id": null,
+  "last_error": null
+}
+```
+
+Use `GET /api/models` or `GET /api/models/{name}` for detailed model configuration and per-model runtime state.
 
 ---
 
@@ -78,6 +115,8 @@ The proxy forwards standard OpenAI-style requests under `/api/v1/*` to the activ
 | `GET, POST` | `/api/v1/{path}` | Forward OpenAI-compatible requests to the loaded runtime. |
 
 Notes:
-- The request body `model` value must match the loaded model name (e.g. `gemma`).
-- If no model is loaded, the proxy returns `400`.
+- The request body `model` value must match a configured model name (e.g. `gemma`).
+- If the requested model is configured but not active, the proxy loads it automatically before forwarding the request.
+- If no model is active and the request does not name a model, the proxy returns `400`.
+- If runtime communication fails while proxying, the gateway clears the active runtime state and returns `503`. A new `load` is required before retrying inference.
 - SSE streaming responses are passed through unchanged.
