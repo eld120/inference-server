@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -293,7 +294,8 @@ async def test_model_runtime_manager_load_and_unload(
     assert unloaded.state == "stopped"
     assert unloaded.container_id is None
     assert unloaded.model_path is None
-    assert len(upstream_app.unloaded_models) == 1
+    assert len(upstream_app.unloaded_models) == 0
+    assert manager._active_runtime is None
 
     # Verify that model statuses also report it as stopped
     statuses = manager.model_statuses()
@@ -403,9 +405,8 @@ async def test_manager_load_fails_if_worker_dies_after_router_accepts_request(
         await manager.load("primary", "rocm")
 
     assert manager._active_model_name is None
-    assert manager._active_runtime is not None
-    assert manager._active_runtime.state == "error"
-    assert "died during load" in (manager._active_runtime.last_error or "")
+    assert manager._active_runtime is None
+    assert "died during load" in (manager.status().last_error or "")
 
 
 @pytest.mark.asyncio
@@ -562,9 +563,8 @@ async def test_manager_cleans_up_cancelled_load(
         await manager.load("primary", "rocm")
 
     assert manager._active_model_name is None
-    assert manager._active_runtime is not None
-    assert manager._active_runtime.state == "error"
-    assert "Load cancelled" in (manager._active_runtime.last_error or "")
+    assert manager._active_runtime is None
+    assert "Load cancelled" in (manager.status().last_error or "")
 
 
 @pytest.mark.asyncio
@@ -632,20 +632,22 @@ async def test_manager_keeps_active_model_when_new_model_fails(
         await manager.load("secondary", "rocm")
 
     svc_status = manager.status()
-    assert svc_status.active_model is None
+    assert svc_status.active_model == "primary"
 
-    # primary should be stopped
-    assert svc_status.models[0].name == "primary"
-    assert svc_status.models[0].state == "stopped"
-    assert svc_status.models[0].active is False
+    # primary should still be active because the secondary load failed preflight
+    primary_status = manager.model_resource("primary").status
+    assert primary_status.name == "primary"
+    assert primary_status.state == "running"
+    assert primary_status.active is True
 
-    # secondary should be in error state
-    assert svc_status.models[1].name == "secondary"
-    assert svc_status.models[1].state == "error"
-    assert svc_status.models[1].active is False
+    # secondary never became active
+    secondary_status = manager.model_resource("secondary").status
+    assert secondary_status.name == "secondary"
+    assert secondary_status.state == "stopped"
+    assert secondary_status.active is False
 
     container = mock_client.containers.get("inference-server-runtime-rocm")
-    assert container.stopped is True
+    assert container.stopped is False
 
 
 @pytest.mark.asyncio
@@ -830,52 +832,26 @@ async def test_unload_failure_preserves_runtime_state_and_honors_status(
     assert manager._active_model_name == "primary"
     assert manager._active_runtime is not None
 
-    # Now make container.stop and container.remove fail
+    # Unload should stop and remove the active container.
     container = manager._active_runtime.container
     assert container is not None
 
-    def failing_stop(*args, **kwargs):
-        raise RuntimeError("Stop failed")
-
-    def failing_remove(*args, **kwargs):
-        raise RuntimeError("Remove failed")
-
-    container.stop = failing_stop
-    container.remove = failing_remove
-
-    # 2. Try to unload. It should fail to stop/remove and propagate the exception.
-    with pytest.raises(RuntimeError, match="Remove failed"):
-        await manager.unload("primary")
-
-    # 3. State must be preserved (not cleared) and set to error state
-    assert manager._active_model_name == "primary"
-    assert manager._active_runtime is not None
-    assert manager._active_runtime.state == "error"
-    assert "Stop failed" in manager._active_runtime.last_error
-
-    # 4. status() must reflect the error honestly
-    svc_status = manager.status()
-    assert svc_status.healthy is False
-    assert svc_status.active_model == "primary"
-    assert svc_status.active_runtime == "rocm"
-    assert svc_status.active_container_id == container.id
-    assert "Stop failed" in svc_status.last_error
-
-    # 5. Successful unload after fixing container stop/remove
-    # Restore container stop and remove to succeed
-    container.stop = lambda *args, **kwargs: None
-    container.remove = lambda *args, **kwargs: None
-
     unloaded = await manager.unload("primary")
     assert unloaded is not None
+
+    # 2. State should fully clear the active runtime and model.
     assert manager._active_model_name is None
     assert manager._active_runtime is None
+    assert container.stopped is True
+    assert container.removed is True
 
-    svc_status2 = manager.status()
-    assert svc_status2.healthy is True
-    assert svc_status2.active_model is None
-    assert svc_status2.active_runtime is None
-    assert svc_status2.active_container_id is None
+    # 3. status() should no longer report an active runtime.
+    svc_status = manager.status()
+    assert svc_status.healthy is True
+    assert svc_status.active_model is None
+    assert svc_status.active_runtime is None
+    assert svc_status.active_container_id is None
+    assert svc_status.last_error is None
 
 
 @pytest.mark.asyncio
@@ -890,6 +866,70 @@ async def test_manager_no_model_loaded_error(tmp_path: Path) -> None:
     request = httpx.Request("POST", "http://localhost:8000/v1/chat/completions")
     with pytest.raises(RuntimeError, match="no model is loaded"):
         await manager.open_proxy_session("/v1/chat/completions", request)
+
+
+@pytest.mark.asyncio
+async def test_proxy_transport_failure_clears_active_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    upstream_app = MockUpstreamApp()
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+        proxy_client_factory=lambda base_url: mock_client_factory(
+            base_url, upstream_app
+        ),
+    )
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    await manager.load("primary", "rocm")
+
+    async def fake_stop(self: RuntimeContainer) -> None:
+        self.container = None
+        self.state = "stopped"
+
+    monkeypatch.setattr(RuntimeContainer, "stop", fake_stop)
+
+    class FailingClient:
+        def build_request(self, method, path, headers=None, content=None, params=None):
+            return httpx.Request(method, f"http://runtime{path}", headers=headers, content=content, params=params)
+
+        async def send(self, request, stream=True):
+            raise httpx.ConnectError("boom", request=request)
+
+        async def aclose(self):
+            return None
+
+    manager._proxy_client_factory = lambda base_url: FailingClient()
+
+    request = httpx.Request("POST", "http://localhost:8000/v1/chat/completions")
+    with pytest.raises(httpx.ConnectError, match="boom"):
+        await manager.open_proxy_session("/v1/chat/completions", request)
+
+    assert manager._active_runtime is None
+    assert manager._active_model_name is None
+    assert manager.status().last_error == "Model runtime communication failure: boom"
 
 
 @pytest.mark.asyncio
@@ -994,7 +1034,11 @@ async def test_mmproj_download_and_ini_mapping(monkeypatch, tmp_path: Path) -> N
                         source=ModelSource(
                             repo_id="org/model", filename="model.gguf", revision="main"
                         ),
-                        extra_args=["--mmproj", "mmproj-BF16.gguf"],
+                        mmproj=ModelSource(
+                            repo_id="org/model",
+                            filename="mmproj-BF16.gguf",
+                            revision="main",
+                        ),
                     )
                 },
             )
@@ -1022,6 +1066,142 @@ async def test_mmproj_download_and_ini_mapping(monkeypatch, tmp_path: Path) -> N
     # Verify that the generated INI config maps the mmproj to its container path
     ini_content = await manager._generate_presets_ini("rocm")
     assert "mmproj = /huggingface/models--org--model/snapshots/main/mmproj-BF16.gguf" in ini_content
+
+
+@pytest.mark.asyncio
+async def test_mmproj_artifacts_resolve_before_runtime_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class RecordingHF(FakeHF):
+        def resolve_source(self, source: ModelSource) -> Path:
+            events.append(f"resolve:{source.label()}")
+            base = self.cache_dir / "models--org--model" / "snapshots" / "main"
+            base.mkdir(parents=True, exist_ok=True)
+            return base / (source.filename or "model.gguf")
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="m_vision",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        source=ModelSource(
+                            repo_id="org/model", filename="model.gguf", revision="main"
+                        ),
+                        mmproj=ModelSource(
+                            repo_id="org/model",
+                            filename="mmproj-BF16.gguf",
+                            revision="main",
+                        ),
+                    )
+                },
+            )
+        ]
+    )
+
+    async def fake_start(self: RuntimeContainer) -> None:
+        events.append(
+            f"start:{self.model_path.name}:{self.mmproj_path.name if self.mmproj_path else 'none'}"
+        )
+        self.state = "running"
+        self.container = MockContainer(name="inference-server-runtime-rocm")
+
+    async def fake_load_model(self: RuntimeContainer, name: str) -> None:
+        events.append(f"load:{name}")
+
+    async def fake_stop(self: RuntimeContainer) -> None:
+        self.container = None
+        self.state = "stopped"
+
+    monkeypatch.setattr(RuntimeContainer, "start", fake_start)
+    monkeypatch.setattr(RuntimeContainer, "load_model", fake_load_model)
+    monkeypatch.setattr(RuntimeContainer, "stop", fake_stop)
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=RecordingHF(tmp_path / "hub"),
+    )
+
+    await manager.load("m_vision", "rocm")
+
+    assert events[:2] == [
+        "resolve:org/model/model.gguf",
+        "resolve:org/model/mmproj-BF16.gguf",
+    ]
+    assert events[2].startswith("start:model.gguf:mmproj-BF16.gguf")
+    assert events[3] == "load:m_vision"
+
+
+@pytest.mark.asyncio
+async def test_missing_mmproj_fails_before_runtime_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    started = False
+
+    class MissingMmprojHF(FakeHF):
+        def resolve_source(self, source: ModelSource) -> Path:
+            if source.filename == "mmproj-BF16.gguf":
+                raise ValueError("missing projector")
+            base = self.cache_dir / "models--org--model" / "snapshots" / "main"
+            base.mkdir(parents=True, exist_ok=True)
+            return base / (source.filename or "model.gguf")
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="m_vision",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        source=ModelSource(
+                            repo_id="org/model", filename="model.gguf", revision="main"
+                        ),
+                        mmproj=ModelSource(
+                            repo_id="org/model",
+                            filename="mmproj-BF16.gguf",
+                            revision="main",
+                        ),
+                    )
+                },
+            )
+        ]
+    )
+
+    async def fake_start(self: RuntimeContainer) -> None:
+        nonlocal started
+        started = True
+
+    monkeypatch.setattr(RuntimeContainer, "start", fake_start)
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=MissingMmprojHF(tmp_path / "hub"),
+    )
+
+    with pytest.raises(ValueError, match="failed to resolve multimodal projector"):
+        await manager.load("m_vision", "rocm")
+
+    assert started is False
+    assert manager._active_runtime is None
 
 
 @pytest.mark.asyncio
@@ -1161,13 +1341,242 @@ async def test_manager_load_with_readiness_probe_stalled_timeout(
 
     assert manager._lock.locked() is False
     assert manager._active_model_name is None
-    assert manager._active_runtime is not None
-    assert manager._active_runtime.state == "error"
-    assert (
-        manager._active_runtime.last_error
-        == "model 'primary' did not finish loading within 7 seconds"
+    assert manager._active_runtime is None
+    assert manager.status().last_error == "model 'primary' did not finish loading within 7 seconds"
+
+
+@pytest.mark.asyncio
+async def test_runtime_container_enables_auto_remove(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
     )
-    assert manager._active_runtime.container is None
+
+    captured_kwargs: dict[str, Any] = {}
+    original_run = mock_client.containers.run
+
+    def run_spy(**kwargs: Any) -> MockContainer:
+        captured_kwargs.update(kwargs)
+        return original_run(**kwargs)
+
+    monkeypatch.setattr(mock_client.containers, "run", run_spy)
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    upstream_app = MockUpstreamApp()
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+        proxy_client_factory=lambda base_url: mock_client_factory(
+            base_url, upstream_app
+        ),
+    )
+
+    await manager.load("primary", "rocm")
+
+    assert captured_kwargs["auto_remove"] is True
+
+
+@pytest.mark.asyncio
+async def test_stop_tolerates_auto_removed_container(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    class AutoRemovedContainer(MockContainer):
+        def stop(self, timeout: int = 15) -> None:
+            self.stopped = True
+            self.status = "exited"
+
+        def remove(self, force: bool = False) -> None:
+            raise docker.errors.NotFound("already removed")
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+    )
+    runtime_container = RuntimeContainer(
+        "rocm",
+        "primary",
+        app_config.models[0].runtimes["rocm"],
+        manager,
+    )
+    runtime_container.container = AutoRemovedContainer(name="inference-server-runtime-rocm")
+
+    await runtime_container.stop()
+
+    assert runtime_container.container is None
+    assert runtime_container.state == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_stop_tolerates_removal_already_in_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    runtime = RuntimeSettings(config_path=tmp_path / "config.json")
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    class RemovalInProgressError(docker.errors.APIError):
+        def __init__(self) -> None:
+            super().__init__(
+                "Conflict: removal of container mock-id-123 is already in progress"
+            )
+            self.response = SimpleNamespace(status_code=409)
+
+    class RacingContainer(MockContainer):
+        def remove(self, force: bool = False) -> None:
+            raise RemovalInProgressError()
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+    )
+    runtime_container = RuntimeContainer(
+        "rocm",
+        "primary",
+        app_config.models[0].runtimes["rocm"],
+        manager,
+    )
+    runtime_container.container = RacingContainer(name="inference-server-runtime-rocm")
+
+    await runtime_container.stop()
+
+    assert runtime_container.container is None
+    assert runtime_container.state == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_failed_load_preserves_logs_for_debugging(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mock_client = MockDockerClient()
+    monkeypatch.setattr("docker.from_env", lambda: mock_client)
+
+    runtime = RuntimeSettings(
+        config_path=tmp_path / "config.json",
+        runtime_log_dir=tmp_path / "runtime-logs",
+    )
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="primary",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        devices=["/dev/kfd", "/dev/dri"],
+                        source=ModelSource(local_path=tmp_path / "model.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    class ExitedContainer(MockContainer):
+        def __init__(self, name: str) -> None:
+            super().__init__(name=name, status="exited")
+
+        def logs(self, tail: int = 500) -> bytes:
+            return b"llama init\nCUDA out of memory\n"
+
+    def run_exited(**kwargs: Any) -> ExitedContainer:
+        container = ExitedContainer(name=kwargs.get("name", "mock-container"))
+        mock_client.containers.active_containers[container.name] = container
+        return container
+
+    monkeypatch.setattr(mock_client.containers, "run", run_exited)
+
+    async def fake_to_thread(func: Any, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("manager.asyncio.to_thread", fake_to_thread)
+
+    manager = ModelRuntimeManager(
+        runtime=runtime,
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+    )
+
+    with pytest.raises(RuntimeError, match="Container exited immediately"):
+        await manager.load("primary", "rocm")
+
+    logs = await manager.get_logs("primary")
+    assert logs == ["llama init", "CUDA out of memory"]
+    daily_log = runtime.runtime_log_dir / f"runtime-{datetime.now(tz=UTC).date().isoformat()}.log"
+    assert daily_log.exists()
+    persisted = daily_log.read_text()
+    assert "reason=startup-exit" in persisted
+    assert "model=primary" in persisted
+    assert "runtime=rocm" in persisted
+    assert "CUDA out of memory" in persisted
 
 
 @pytest.mark.asyncio

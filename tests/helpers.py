@@ -38,15 +38,22 @@ def make_model(
     name: str,
     source: Path | ModelSource,
     *,
+    mmproj: Path | ModelSource | None = None,
     extra_args: list[str] | None = None,
     speculative: SpeculativeConfig | dict[str, Any] | None = None,
 ) -> ModelConfig:
     resolved_source = (
         source if isinstance(source, ModelSource) else ModelSource(local_path=source)
     )
+    resolved_mmproj = None
+    if mmproj is not None:
+        resolved_mmproj = (
+            mmproj if isinstance(mmproj, ModelSource) else ModelSource(local_path=mmproj)
+        )
     return ModelConfig(
         name=name,
         source=resolved_source,
+        mmproj=resolved_mmproj,
         extra_args=extra_args or [],
         speculative=(
             speculative

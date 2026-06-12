@@ -75,8 +75,10 @@ def setup_mocks(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
-async def test_reuse_compatible_runtime(setup_mocks, tmp_path: Path) -> None:
-    """1. Reuse on same runtime with identical compatible settings."""
+async def test_fresh_runtime_started_even_when_configs_match(
+    setup_mocks, tmp_path: Path
+) -> None:
+    """1. Each model switch starts a fresh runtime even for matching configs."""
     mock_client = setup_mocks
 
     app_config = AppConfig(
@@ -121,13 +123,16 @@ async def test_reuse_compatible_runtime(setup_mocks, tmp_path: Path) -> None:
     assert len(mock_client.containers.run_calls) == 1
     assert manager._active_model_name == "model_a"
 
-    # Load model_b - compatible, should reuse container
+    first_container = mock_client.containers.active_containers[
+        "inference-server-runtime-rocm"
+    ]
+
+    # Load model_b - same runtime/config, but should still replace the container
     await manager.load("model_b", "rocm")
-    assert len(mock_client.containers.run_calls) == 1  # No new container run call
+    assert len(mock_client.containers.run_calls) == 2
     assert manager._active_model_name == "model_b"
-    assert (
-        len(upstream_app.unloaded_models) == 1
-    )  # model_a unloaded first inside container
+    assert len(upstream_app.unloaded_models) == 0
+    assert first_container.stopped is True
 
 
 @pytest.mark.asyncio
@@ -239,8 +244,8 @@ async def test_runtime_switch_removes_old_container(
 
 
 @pytest.mark.asyncio
-async def test_unload_removes_active_container(setup_mocks, tmp_path: Path) -> None:
-    """4. Unload removes the active runtime container."""
+async def test_unload_stops_active_container(setup_mocks, tmp_path: Path) -> None:
+    """4. Unload tears down the active runtime container."""
     mock_client = setup_mocks
 
     app_config = AppConfig(
@@ -275,7 +280,7 @@ async def test_unload_removes_active_container(setup_mocks, tmp_path: Path) -> N
 
     # Perform unload
     await manager.unload("model_a")
-    assert container.stopped is True  # Container stopped and removed
+    assert container.stopped is True
     assert manager._active_runtime is None
     assert manager._active_model_name is None
 
@@ -284,7 +289,7 @@ async def test_unload_removes_active_container(setup_mocks, tmp_path: Path) -> N
 async def test_status_after_unload(setup_mocks, tmp_path: Path) -> None:
     """5. GET /api/status reports correct values after unload.
 
-    Specifically, active_runtime and active_container_id should be null.
+    Specifically, active_model and active runtime should both be cleared.
     """
     _ = setup_mocks
 
@@ -331,6 +336,63 @@ async def test_status_after_unload(setup_mocks, tmp_path: Path) -> None:
     assert unloaded_status.active_model is None
     assert unloaded_status.active_runtime is None
     assert unloaded_status.active_container_id is None
+
+
+@pytest.mark.asyncio
+async def test_unload_then_load_starts_fresh_runtime(
+    setup_mocks, tmp_path: Path
+) -> None:
+    mock_client = setup_mocks
+
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="model_a",
+                runtimes={
+                    "vulkan": RuntimeConfig(
+                        docker_image="inference-server-llama-vulkan:26.04-7e50ef7",
+                        source=ModelSource(local_path=tmp_path / "model_a.gguf"),
+                    )
+                },
+            ),
+            ModelConfig(
+                name="model_b",
+                runtimes={
+                    "vulkan": RuntimeConfig(
+                        docker_image="inference-server-llama-vulkan:26.04-7e50ef7",
+                        source=ModelSource(local_path=tmp_path / "model_b.gguf"),
+                    )
+                },
+            ),
+        ],
+    )
+
+    upstream_app = MockUpstreamApp()
+    manager = ModelRuntimeManager(
+        runtime=RuntimeSettings(config_path=tmp_path / "config.json"),
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+        proxy_client_factory=lambda base_url: mock_client_factory(
+            base_url, upstream_app
+        ),
+    )
+
+    await manager.load("model_a", "vulkan")
+    original_runtime = manager._active_runtime
+    assert original_runtime is not None
+    original_container = original_runtime.container
+    assert original_container is not None
+
+    await manager.unload("model_a")
+    assert manager._active_runtime is None
+    assert original_container.stopped is True
+
+    await manager.load("model_b", "vulkan")
+    assert manager._active_runtime is not None
+    assert manager._active_runtime is not original_runtime
+    assert manager._active_runtime.container is not original_container
+    assert manager._active_model_name == "model_b"
+    assert len(mock_client.containers.active_containers) == 1
 
 
 @pytest.mark.asyncio
@@ -524,22 +586,141 @@ async def test_cleanup_failure_preserves_honest_state_and_status(
     with pytest.raises(RuntimeError, match="mock remove failed"):
         await manager.cleanup()
 
-    # Verify that active runtime and model name are preserved honestly on failure
-    assert manager._active_runtime is not None
-    assert manager._active_model_name == "model_a"
-    assert manager._active_runtime.state == "error"
-    assert "mock remove failed" in manager._active_runtime.last_error
+    # Verify that failed cleanup clears stale active runtime state.
+    assert manager._active_runtime is None
+    assert manager._active_model_name is None
 
     # Verify that status() after cleanup failure reports:
     # - healthy is False
-    # - non-null active_model
-    # - non-null active_runtime
-    # - non-null active_container_id
+    # - no stale active_model/runtime/container_id
     # - meaningful last_error
     svc_status = manager.status()
     assert svc_status.healthy is False
-    assert svc_status.active_model == "model_a"
-    assert svc_status.active_runtime == "rocm"
-    assert svc_status.active_container_id == "failing-container-id"
+    assert svc_status.active_model is None
+    assert svc_status.active_runtime is None
+    assert svc_status.active_container_id is None
     assert svc_status.last_error is not None
     assert "mock remove failed" in svc_status.last_error
+
+
+@pytest.mark.asyncio
+async def test_unload_then_cleanup_with_logs(setup_mocks, tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+    mock_client = setup_mocks
+
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="model_a",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        source=ModelSource(local_path=tmp_path / "model_a.gguf"),
+                    )
+                },
+            )
+        ],
+    )
+
+    upstream_app = MockUpstreamApp()
+    manager = ModelRuntimeManager(
+        runtime=RuntimeSettings(
+            config_path=tmp_path / "config.json",
+            runtime_log_dir=tmp_path / "runtime-logs",
+        ),
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+        proxy_client_factory=lambda base_url: mock_client_factory(
+            base_url, upstream_app
+        ),
+    )
+
+    await manager.load("model_a", "rocm")
+    assert manager._active_runtime is not None
+    assert manager._active_model_name == "model_a"
+
+    # Perform unload
+    await manager.unload("model_a")
+    assert manager._active_runtime is None
+    assert manager._active_model_name is None
+
+    # Perform cleanup
+    await manager.cleanup()
+    assert manager._active_runtime is None
+    assert manager._active_model_name is None
+
+    # Check logs directory contains logs from the stopped rocm container
+    daily_log = manager._runtime.runtime_log_dir.expanduser() / f"runtime-{datetime.now(tz=UTC).date().isoformat()}.log"
+    assert daily_log.exists()
+    log_content = daily_log.read_text()
+    assert "model=model_a" in log_content
+
+
+@pytest.mark.asyncio
+async def test_unload_then_incompatible_load_with_logs(setup_mocks, tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+    mock_client = setup_mocks
+
+    app_config = AppConfig(
+        models=[
+            ModelConfig(
+                name="model_a",
+                runtimes={
+                    "rocm": RuntimeConfig(
+                        docker_image="inference-server-llama-rocm:7.2.1-7e50ef7",
+                        source=ModelSource(local_path=tmp_path / "model_a.gguf"),
+                    )
+                },
+            ),
+            ModelConfig(
+                name="model_b",
+                runtimes={
+                    "vulkan": RuntimeConfig(
+                        docker_image="inference-server-llama-vulkan:26.04-7e50ef7",
+                        source=ModelSource(local_path=tmp_path / "model_b.gguf"),
+                    )
+                },
+            ),
+        ],
+    )
+
+    upstream_app = MockUpstreamApp()
+    manager = ModelRuntimeManager(
+        runtime=RuntimeSettings(
+            config_path=tmp_path / "config.json",
+            runtime_log_dir=tmp_path / "runtime-logs",
+        ),
+        app_config=app_config,
+        hf=FakeHF(tmp_path),
+        proxy_client_factory=lambda base_url: mock_client_factory(
+            base_url, upstream_app
+        ),
+    )
+
+    await manager.load("model_a", "rocm")
+    assert manager._active_runtime is not None
+    rocm_container = mock_client.containers.active_containers["inference-server-runtime-rocm"]
+    assert rocm_container.stopped is False
+
+    # Unload model_a
+    await manager.unload("model_a")
+    assert manager._active_runtime is None
+    assert rocm_container.stopped is True
+
+    # Load model_b on vulkan (incompatible)
+    await manager.load("model_b", "vulkan")
+    
+    # Old container should be stopped and removed
+    assert rocm_container.stopped is True
+    assert rocm_container.removed is True
+    
+    # New container should be active
+    assert "inference-server-runtime-vulkan" in mock_client.containers.active_containers
+    vulkan_container = mock_client.containers.active_containers["inference-server-runtime-vulkan"]
+    assert vulkan_container.stopped is False
+
+    # Check logs directory contains logs from the stopped rocm container
+    daily_log = manager._runtime.runtime_log_dir.expanduser() / f"runtime-{datetime.now(tz=UTC).date().isoformat()}.log"
+    assert daily_log.exists()
+    log_content = daily_log.read_text()
+    assert "model=model_a" in log_content

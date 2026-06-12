@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+import re
 
 import docker.errors
 import docker.models.containers
@@ -40,12 +41,13 @@ class RuntimeContainer:
     def __init__(
         self,
         runtime_type: str,
-        model_name: str,
+        model_name: str | None,
         rt_cfg: RuntimeConfig,
         manager: ModelRuntimeManager,
     ) -> None:
         self.runtime_type = runtime_type
-        self.model_name = model_name
+        self._model_name = model_name
+        self.last_model_name = model_name
         self.config = rt_cfg
         self.manager = manager
         self.state: RuntimeState = "stopped"
@@ -53,7 +55,28 @@ class RuntimeContainer:
         self.last_error: str | None = None
         self.model_path: Path | None = None
         self.draft_model_path: Path | None = None
+        self.mmproj_path: Path | None = None
+        self._recent_logs: list[str] = []
+        self._last_persisted_log_blob: str | None = None
+        self._last_persisted_log_blob_by_model: dict[str, str] = {}
         self.started_at: datetime | None = None
+
+    @property
+    def model_name(self) -> str | None:
+        return self._model_name
+
+    @model_name.setter
+    def model_name(self, value: str | None) -> None:
+        self._model_name = value
+        if value is not None:
+            self.last_model_name = value
+
+    def clear_loaded_model_state(self) -> None:
+        self.model_name = None
+        self.model_path = None
+        self.draft_model_path = None
+        self.mmproj_path = None
+        self.last_error = None
 
     @property
     def base_url(self) -> str:
@@ -101,6 +124,7 @@ class RuntimeContainer:
                 active_model_name=self.model_name,
                 active_model_resolved_path=self.model_path,
                 active_model_draft_resolved_path=self.draft_model_path,
+                active_model_mmproj_resolved_path=self.mmproj_path,
             )
             ini_dir = self.manager._hf.cache_dir / "presets"
             await asyncio.to_thread(ini_dir.mkdir, parents=True, exist_ok=True)
@@ -156,6 +180,17 @@ class RuntimeContainer:
                             "bind": bind_path,
                             "mode": "ro",
                         }
+                if rt_cfg.mmproj is not None and rt_cfg.mmproj.local_path is not None:
+                    local_p = Path(rt_cfg.mmproj.local_path).resolve().absolute()
+                    cache_dir = self.manager._hf.cache_dir.resolve().absolute()
+                    if not local_p.is_relative_to(cache_dir):
+                        parent = local_p.parent
+                        suffix = self.manager._dir_hash(parent)
+                        bind_path = f"/local_models_{suffix}"
+                        volumes[str(parent)] = {
+                            "bind": bind_path,
+                            "mode": "ro",
+                        }
 
             # Apply runtime specific custom mounts
             for src, dst in self.volumes.items():
@@ -202,27 +237,62 @@ class RuntimeContainer:
             self.state = "error"
             raise
 
+
     async def stop(self) -> None:
         container = self.container
         if container is None:
+            self.state = "stopped"
             return
+        container_id = getattr(container, "id", None)
+        try:
+            container_name = container.name
+        except Exception:
+            container_name = None
         self.state = "stopping"
         try:
-            logger.info("Stopping container: %s", container.name)
-            await asyncio.to_thread(container.stop, timeout=10)
+            logger.info("Stopping container: %s", container_name or "unknown")
+            await self._capture_recent_logs(container, "stop")
+            try:
+                await asyncio.to_thread(container.stop, timeout=10)
+            except Exception as stop_exc:
+                if not (
+                    self.manager._is_container_not_found_error(stop_exc)
+                    or self.manager._is_removal_in_progress_error(stop_exc)
+                ):
+                    raise
+            try:
+                await asyncio.to_thread(container.remove, force=True)
+            except Exception as stop_exc:
+                if not (
+                    self.manager._is_container_not_found_error(stop_exc)
+                    or self.manager._is_removal_in_progress_error(stop_exc)
+                ):
+                    raise
             self.container = None
-            self.state = "stopped"
         except Exception as stop_exc:
             logger.warning("Graceful stop failed: %s. Force removing.", stop_exc)
             try:
-                await asyncio.to_thread(container.remove, force=True)
+                await self._capture_recent_logs(container, "force-remove")
+                try:
+                    await asyncio.to_thread(container.remove, force=True)
+                except Exception as remove_exc:
+                    if not (
+                        self.manager._is_container_not_found_error(remove_exc)
+                        or self.manager._is_removal_in_progress_error(remove_exc)
+                    ):
+                        raise
                 self.container = None
-                self.state = "stopped"
             except Exception as rm_exc:
                 logger.error("Force remove also failed: %s", rm_exc)
                 self.state = "error"
                 self.last_error = f"Stop failed: {stop_exc}. Remove failed: {rm_exc}."
                 raise rm_exc
+        if container_name:
+            await self.manager._wait_for_container_release(
+                container_name,
+                known_container_id=container_id,
+            )
+        self.state = "stopped"
 
     async def load_model(self, name: str) -> None:
         async with self.manager.create_proxy_client(self.base_url) as client:
@@ -244,12 +314,15 @@ class RuntimeContainer:
     async def get_logs(self) -> list[str]:
         container = self.container
         if container is None:
-            return []
+            return list(self._recent_logs)
         try:
             logs_bytes = await asyncio.to_thread(container.logs, tail=500)
-            return logs_bytes.decode("utf-8", errors="replace").splitlines()
+            lines = logs_bytes.decode("utf-8", errors="replace").splitlines()
+            self._recent_logs = lines
+            await self._persist_log_snapshot("live-fetch", lines)
+            return lines
         except Exception:
-            return []
+            return list(self._recent_logs)
 
     async def _ensure_image_pulled(self) -> None:
         image = self.docker_image
@@ -277,6 +350,9 @@ class RuntimeContainer:
                     try:
                         logs_bytes = await asyncio.to_thread(container.logs, tail=50)
                         last_logs = logs_bytes.decode("utf-8", errors="replace").strip()
+                        lines = last_logs.splitlines()
+                        self._recent_logs = lines
+                        await self._persist_log_snapshot("startup-exit", lines)
                     except Exception:
                         last_logs = ""
                     msg = "Container exited immediately."
@@ -317,6 +393,9 @@ class RuntimeContainer:
                 try:
                     logs_bytes = await asyncio.to_thread(container.logs, tail=100)
                     last_logs = logs_bytes.decode("utf-8", errors="replace").strip()
+                    lines = last_logs.splitlines()
+                    self._recent_logs = lines
+                    await self._persist_log_snapshot("load-exit", lines)
                 except Exception:
                     last_logs = ""
                 msg = f"Runtime container exited while loading model '{name}'."
@@ -329,6 +408,9 @@ class RuntimeContainer:
                 try:
                     logs_bytes = await asyncio.to_thread(container.logs, tail=100)
                     last_logs = logs_bytes.decode("utf-8", errors="replace").strip()
+                    lines = last_logs.splitlines()
+                    self._recent_logs = lines
+                    await self._persist_log_snapshot("worker-defunct", lines)
                 except Exception:
                     last_logs = ""
                 msg = f"Model worker for '{name}' died during load."
@@ -432,6 +514,83 @@ class RuntimeContainer:
 
         return "missing"
 
+    async def _capture_recent_logs(
+        self,
+        container: docker.models.containers.Container,
+        reason: str = "snapshot",
+    ) -> None:
+        try:
+            logs_bytes = await asyncio.to_thread(container.logs, tail=500)
+        except Exception:
+            return
+        lines = logs_bytes.decode("utf-8", errors="replace").splitlines()
+        self._recent_logs = lines
+        await self._persist_log_snapshot(reason, lines)
+
+    async def _persist_log_snapshot(self, reason: str, lines: list[str]) -> None:
+        if not lines:
+            return
+
+        model_name = self.model_name or self.last_model_name
+        if model_name:
+            self.manager._logs_cache[model_name] = lines
+
+        blob = "\n".join(lines)
+        if blob != self._last_persisted_log_blob:
+            self._last_persisted_log_blob = blob
+            await asyncio.to_thread(self._append_logs_to_disk, reason, blob)
+
+        if model_name:
+            last_model_blob = self._last_persisted_log_blob_by_model.get(model_name)
+            if blob != last_model_blob:
+                self._last_persisted_log_blob_by_model[model_name] = blob
+                await asyncio.to_thread(self._save_last_logs_to_disk, model_name, lines)
+
+    def _append_logs_to_disk(self, reason: str, blob: str) -> None:
+        log_dir = self.manager._runtime.runtime_log_dir.expanduser().resolve()
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        stamp = datetime.now(tz=UTC)
+        filename = f"runtime-{stamp.date().isoformat()}.log"
+        log_path = log_dir / filename
+
+        model_slug = self._slugify(self.model_name or self.last_model_name)
+        runtime_slug = self._slugify(self.runtime_type)
+        container_id = "-"
+        if self.container is not None and getattr(self.container, "id", None):
+            container_id = str(self.container.id)
+
+        started_at = (
+            self.started_at.isoformat() if self.started_at is not None else "-"
+        )
+        header = (
+            f"[{stamp.isoformat()}] "
+            f"model={model_slug} runtime={runtime_slug} state={self.state} "
+            f"reason={reason} container_id={container_id} started_at={started_at}"
+        )
+        entry = f"{header}\n{blob}\n\n"
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(entry)
+
+    def _save_last_logs_to_disk(self, model_name: str, lines: list[str]) -> None:
+        import json
+        try:
+            log_dir = self.manager._runtime.runtime_log_dir.expanduser().resolve()
+            last_logs_dir = log_dir / "last_logs"
+            last_logs_dir.mkdir(parents=True, exist_ok=True)
+            log_path = last_logs_dir / f"{self._slugify(model_name)}.json"
+            with log_path.open("w", encoding="utf-8") as fh:
+                json.dump(lines, fh)
+        except Exception as e:
+            logger.warning("Failed to save last logs for model %s to disk: %s", model_name, e)
+
+    @staticmethod
+    def _slugify(value: str | None) -> str:
+        if not value:
+            return "unknown"
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
+        return slug or "unknown"
+
 
 @dataclass(slots=True)
 class ProxySession:
@@ -458,6 +617,7 @@ class ActiveModel:
         return SimpleNamespace(
             name=self.model_config.name,
             model=rt_cfg.source,
+            mmproj=rt_cfg.mmproj,
             speculative=rt_cfg.speculative,
             extra_args=rt_cfg.extra_args,
             bind_host=rt_cfg.bind_host,
@@ -466,6 +626,9 @@ class ActiveModel:
 
 
 class ModelRuntimeManager:
+    _container_release_poll_attempts = 30
+    _container_release_poll_interval_seconds = 0.5
+
     def __init__(
         self,
         runtime: RuntimeSettings,
@@ -483,12 +646,58 @@ class ModelRuntimeManager:
         self._active_model_name: str | None = None
         self._active_runtime: RuntimeContainer | None = None
         self._docker_client: docker.DockerClient | None = None
+        self._logs_cache: dict[str, list[str]] = {}
+        self._last_error: str | None = None
 
     @staticmethod
     def _dir_hash(parent: Path) -> str:
         import hashlib
 
         return hashlib.md5(str(parent).encode()).hexdigest()[:8]
+
+    @staticmethod
+    def _exception_message_parts(exc: BaseException) -> list[str]:
+        parts: list[str] = []
+        for arg in getattr(exc, "args", ()):
+            if arg:
+                parts.append(repr(arg) if isinstance(arg, BaseException) else str(arg))
+
+        response = getattr(exc, "response", None)
+        explanation = getattr(exc, "explanation", None)
+        if explanation:
+            parts.append(str(explanation))
+        if response is not None:
+            for attr in ("text", "reason", "status", "status_code"):
+                value = getattr(response, attr, None)
+                if value:
+                    parts.append(str(value))
+        return parts
+
+    @staticmethod
+    def _is_removal_in_progress_error(exc: BaseException) -> bool:
+        if not isinstance(exc, docker.errors.APIError):
+            return False
+
+        status_code = getattr(exc, "status_code", None)
+        response = getattr(exc, "response", None)
+        if status_code is None and response is not None:
+            status_code = getattr(response, "status_code", None)
+        if status_code != 409:
+            return False
+
+        message = " ".join(ModelRuntimeManager._exception_message_parts(exc)).lower()
+        return (
+            "removal already in progress" in message
+            or "removal of container" in message and "already in progress" in message
+        )
+
+    @staticmethod
+    def _is_container_not_found_error(exc: BaseException) -> bool:
+        if isinstance(exc, docker.errors.NotFound):
+            return True
+        return "not found" in " ".join(
+            ModelRuntimeManager._exception_message_parts(exc)
+        ).lower()
 
     @property
     def docker_client(self) -> docker.DockerClient:
@@ -604,14 +813,14 @@ class ModelRuntimeManager:
         return self._to_resource(self._get_model_config(name))
 
     def status(self) -> ServiceStatus:
-        healthy = True
+        healthy = self._last_error is None
         active_container_id = None
-        last_error = None
+        last_error = self._last_error
         active_runtime = None
         if self._active_runtime is not None:
             if self._active_runtime.state == "error":
                 healthy = False
-            last_error = self._active_runtime.last_error
+            last_error = self._active_runtime.last_error or self._last_error
             active_runtime = self._active_runtime.runtime_type
             if self._active_runtime.container is not None:
                 active_container_id = self._active_runtime.container.id
@@ -624,7 +833,6 @@ class ModelRuntimeManager:
             active_runtime=active_runtime,
             active_container_id=active_container_id,
             last_error=last_error,
-            models=self.model_resources(),
         )
 
     def _get_model_config(self, name: str) -> ModelConfig:
@@ -660,6 +868,7 @@ class ModelRuntimeManager:
             devices=backend_cfg.devices,
             volumes=backend_cfg.volumes,
             shared_args=backend_cfg.shared_args,
+            mmproj=model_config.mmproj,
             extra_args=model_config.extra_args,
             speculative=model_config.speculative,
             bind_host=backend_cfg.bind_host,
@@ -673,181 +882,77 @@ class ModelRuntimeManager:
             return next(iter(self._config.backends))
         return None
 
-    @staticmethod
-    def _runtime_is_reusable(
-        active_runtime: RuntimeContainer | None,
-        runtime: str,
+    async def _resolve_runtime_artifacts(
+        self,
         rt_cfg: RuntimeConfig,
-    ) -> bool:
+    ) -> tuple[Path, Path | None, Path | None]:
+        try:
+            model_path = await asyncio.to_thread(self._hf.resolve_source, rt_cfg.source)
+        except Exception as exc:
+            raise ValueError(
+                f"failed to resolve model artifact '{rt_cfg.source.label()}': {exc}"
+            ) from exc
+
+        draft_model_path: Path | None = None
+        if rt_cfg.speculative.draft_model is not None:
+            try:
+                draft_model_path = await asyncio.to_thread(
+                    self._hf.resolve_source,
+                    rt_cfg.speculative.draft_model,
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"failed to resolve draft model artifact "
+                    f"'{rt_cfg.speculative.draft_model.label()}': {exc}"
+                ) from exc
+
+        mmproj_path: Path | None = None
+        if rt_cfg.mmproj is not None:
+            try:
+                mmproj_path = await asyncio.to_thread(
+                    self._hf.resolve_source, rt_cfg.mmproj
+                )
+            except Exception as exc:
+                repo_label = rt_cfg.mmproj.repo_id or rt_cfg.source.repo_id or "local"
+                raise ValueError(
+                    f"failed to resolve multimodal projector for repo "
+                    f"'{repo_label}' ({rt_cfg.mmproj.label()}): {exc}"
+                ) from exc
+
         return (
-            active_runtime is not None
-            and active_runtime.state == "running"
-            and active_runtime.container is not None
-            and active_runtime.runtime_type == runtime
-            and active_runtime.docker_image == rt_cfg.docker_image
-            and active_runtime.devices == rt_cfg.devices
-            and active_runtime.volumes == rt_cfg.volumes
-            and active_runtime.bind_host == rt_cfg.bind_host
-            and active_runtime.connect_host == rt_cfg.connect_host
-            and active_runtime.shared_args == rt_cfg.shared_args
+            Path(model_path).resolve().absolute(),
+            None if draft_model_path is None else Path(draft_model_path).resolve().absolute(),
+            None if mmproj_path is None else Path(mmproj_path).resolve().absolute(),
         )
 
     async def load(self, name: str, runtime: str) -> ModelResource:
         async with self._lock:
-            # 1. Resolve target model config
             model_cfg = self._get_model_config(name)
             rt_cfg = self._resolve_runtime_config(model_cfg, runtime)
 
-            # 2. Check if running container is already active and compatible
-            is_compatible = self._runtime_is_reusable(
-                self._active_runtime, runtime, rt_cfg
+            model_path, draft_model_path, mmproj_path = (
+                await self._resolve_runtime_artifacts(rt_cfg)
             )
 
-            if is_compatible and self._active_runtime is not None:
-                if self._active_model_name == name:
-                    return self._to_resource(model_cfg)
-
-                # Swap the model on the existing runtime container
-                # 1. Always unload the old model first
-                if self._active_model_name:
-                    try:
-                        await self._active_runtime.unload_model(self._active_model_name)
-                    except Exception as exc:
-                        self._active_runtime.state = "error"
-                        self._active_runtime.last_error = str(exc)
-                        self._active_model_name = None
-                        raise
-                    self._active_model_name = None
-
-                # 2. Update config to target model
-                self._active_runtime.model_name = name
-                self._active_runtime.config = rt_cfg
-
-                try:
-                    # 3. Resolve and download the new model and draft model
-                    model_path = await asyncio.to_thread(
-                        self._hf.resolve_source, rt_cfg.source
-                    )
-                    draft_model_path = None
-                    if rt_cfg.speculative.draft_model is not None:
-                        draft_model_path = await asyncio.to_thread(
-                            self._hf.resolve_source,
-                            rt_cfg.speculative.draft_model,
-                        )
-
-                    # Check for --mmproj in extra_args and pre-download it
-                    for idx in range(len(rt_cfg.extra_args)):
-                        arg = rt_cfg.extra_args[idx]
-                        mmproj_filename = None
-                        if arg == "--mmproj" and idx + 1 < len(rt_cfg.extra_args):
-                            mmproj_filename = rt_cfg.extra_args[idx + 1]
-                        elif arg.startswith("--mmproj="):
-                            parts = arg.split("=", 1)
-                            if len(parts) > 1:
-                                mmproj_filename = parts[1]
-
-                        if mmproj_filename is not None:
-                            mmproj_source = ModelSource(
-                                repo_id=rt_cfg.source.repo_id,
-                                filename=mmproj_filename,
-                                revision=rt_cfg.source.revision,
-                            )
-                            await asyncio.to_thread(
-                                self._hf.resolve_source, mmproj_source
-                            )
-
-                    self._active_runtime.model_path = (
-                        Path(model_path).resolve().absolute()
-                    )
-                    if draft_model_path is not None:
-                        self._active_runtime.draft_model_path = (
-                            Path(draft_model_path).resolve().absolute()
-                        )
-                    else:
-                        self._active_runtime.draft_model_path = None
-
-                    # 4. Regenerate presets INI file with target model path
-                    ini_content = await self._generate_presets_ini(
-                        runtime_type=runtime,
-                        active_model_name=name,
-                        active_model_resolved_path=(self._active_runtime.model_path),
-                        active_model_draft_resolved_path=(
-                            self._active_runtime.draft_model_path
-                        ),
-                    )
-                    ini_dir = self._hf.cache_dir / "presets"
-                    await asyncio.to_thread(ini_dir.mkdir, parents=True, exist_ok=True)
-                    ini_path = ini_dir / f"{runtime}.ini"
-                    await asyncio.to_thread(ini_path.write_text, ini_content)
-
-                    # 5. Load the model on the runtime
-                    self._active_runtime.state = "starting"
-                    await self._active_runtime.load_model(name)
-                    self._active_runtime.state = "running"
-                    self._active_runtime.last_error = None
-                    self._active_model_name = name
-                except asyncio.CancelledError:
-                    self._active_runtime.state = "error"
-                    self._active_runtime.last_error = (
-                        f"Load cancelled while activating model '{name}'."
-                    )
-                    self._active_model_name = None
-                    try:
-                        await self._active_runtime.stop()
-                    except Exception:
-                        pass
-                    self._active_runtime.state = "error"
-                    raise
-                except Exception as exc:
-                    self._active_runtime.state = "error"
-                    self._active_runtime.last_error = str(exc)
-                    self._active_model_name = None
-                    try:
-                        await self._active_runtime.stop()
-                    except Exception:
-                        pass
-                    self._active_runtime.state = "error"
-                    raise
-
-                return self._to_resource(model_cfg)
-
-            # 3. Not compatible. Stop current active runtime if running
             if self._active_runtime is not None:
-                if self._active_model_name:
-                    try:
-                        await self._active_runtime.unload_model(self._active_model_name)
-                    except Exception:
-                        pass
-                await self._active_runtime.stop()
-                self._active_runtime = None
-                self._active_model_name = None
+                try:
+                    await self._stop_runtime(self._active_runtime)
+                except Exception as exc:
+                    self._last_error = str(exc)
+                    raise
 
-            # Clean up any other running managed containers
-            # (e.g. orphans from previous crashes)
             await self._cleanup_all_managed_containers()
 
-            # 4. Initialize and start new runtime
             runtime_obj = RuntimeContainer(runtime, name, rt_cfg, self)
+            runtime_obj.model_path = model_path
+            runtime_obj.draft_model_path = draft_model_path
+            runtime_obj.mmproj_path = mmproj_path
 
             self._active_runtime = runtime_obj
+            self._active_model_name = None
+            self._last_error = None
 
             try:
-                # Resolve paths before starting the runtime
-                model_path = await asyncio.to_thread(
-                    self._hf.resolve_source, rt_cfg.source
-                )
-                draft_model_path = None
-                if rt_cfg.speculative.draft_model is not None:
-                    draft_model_path = await asyncio.to_thread(
-                        self._hf.resolve_source, rt_cfg.speculative.draft_model
-                    )
-
-                runtime_obj.model_path = Path(model_path).resolve().absolute()
-                if draft_model_path is not None:
-                    runtime_obj.draft_model_path = (
-                        Path(draft_model_path).resolve().absolute()
-                    )
-
                 await runtime_obj.start()
                 runtime_obj.state = "starting"
                 await runtime_obj.load_model(name)
@@ -855,73 +960,113 @@ class ModelRuntimeManager:
                 runtime_obj.state = "running"
                 runtime_obj.last_error = None
                 self._active_model_name = name
+                self._last_error = None
                 return self._to_resource(model_cfg)
             except asyncio.CancelledError:
                 logger.warning("Load cancelled for model %s", name)
-                try:
-                    await runtime_obj.stop()
-                except Exception as stop_exc:
-                    logger.error(
-                        "Failed to stop runtime after cancelled load: %s", stop_exc
-                    )
-
+                error_message = f"Load cancelled for model '{name}'."
                 runtime_obj.state = "error"
-                runtime_obj.last_error = f"Load cancelled for model '{name}'."
-                self._active_model_name = None
+                runtime_obj.last_error = error_message
+                self._last_error = error_message
+                await self._discard_runtime(runtime_obj)
                 raise
             except Exception as exc:
                 logger.error(
                     "Failed to start/load runtime for model %s: %s", name, exc
                 )
-                try:
-                    await runtime_obj.stop()
-                except Exception as stop_exc:
-                    logger.error(
-                        "Failed to stop runtime after start/load failure: %s",
-                        stop_exc,
-                    )
-
                 runtime_obj.state = "error"
                 runtime_obj.last_error = str(exc)
-                self._active_model_name = None
+                self._last_error = str(exc)
+                await self._discard_runtime(runtime_obj)
                 raise
 
     async def unload(self, name: str | None = None) -> ModelResource | None:
         async with self._lock:
-            target_name = name or self._active_model_name
-            if target_name is None or self._active_model_name != target_name:
-                return None
+            if name is None:
+                target_name = self._active_model_name
+                if target_name is None:
+                    return None
+            else:
+                target_name = name
 
             model_cfg = self._get_model_config(target_name)
-            if self._active_runtime is not None:
-                try:
-                    await self._active_runtime.unload_model(target_name)
-                except Exception as unload_exc:
-                    try:
-                        await self._active_runtime.stop()
-                        self._active_runtime = None
-                        self._active_model_name = None
-                    except Exception:
-                        pass
-                    raise unload_exc
 
-                await self._active_runtime.stop()
-                self._active_runtime = None
+            active_runtime = self._active_runtime
+            if active_runtime is None:
                 self._active_model_name = None
-            else:
-                self._active_model_name = None
+                self._last_error = None
+                return self._to_resource(model_cfg)
 
+            if target_name != self._active_model_name:
+                return self._to_resource(model_cfg)
+
+            try:
+                await self._stop_runtime(active_runtime)
+            except Exception as exc:
+                self._last_error = str(exc)
+                raise
+
+            self._last_error = None
             return self._to_resource(model_cfg)
+
+    async def _wait_for_container_release(
+        self,
+        name: str,
+        known_container_id: str | None = None,
+    ) -> None:
+        for _ in range(self._container_release_poll_attempts):
+            try:
+                container = await asyncio.to_thread(self.docker_client.containers.get, name)
+            except Exception as exc:
+                if self._is_container_not_found_error(exc):
+                    return
+                raise
+
+            current_id = getattr(container, "id", None)
+            if known_container_id is not None and current_id != known_container_id:
+                return
+
+            if getattr(container, "removed", False):
+                return
+
+            await asyncio.sleep(self._container_release_poll_interval_seconds)
+
+        raise RuntimeError(
+            f"Failed to release container name '{name}' within wait budget."
+        )
 
     async def _remove_conflicting_container(self, name: str) -> None:
         try:
             old = await asyncio.to_thread(self.docker_client.containers.get, name)
-            if old.labels.get("managed-by") == "inference-server":
-                logger.info("Removing conflicting container: %s", name)
-                await asyncio.to_thread(old.stop, timeout=5)
-                await asyncio.to_thread(old.remove, force=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            if self._is_container_not_found_error(exc):
+                return None
+            raise
+
+        if old.labels.get("managed-by") != "inference-server":
+            return
+
+        logger.info("Removing conflicting container: %s", name)
+        old_id = getattr(old, "id", None)
+        try:
+            await asyncio.to_thread(old.stop, timeout=5)
+        except Exception as stop_exc:
+            if not (
+                self._is_container_not_found_error(stop_exc)
+                or self._is_removal_in_progress_error(stop_exc)
+            ):
+                raise
+
+        try:
+            await asyncio.to_thread(old.remove, force=True)
+        except Exception as remove_exc:
+            if not (
+                self._is_container_not_found_error(remove_exc)
+                or self._is_removal_in_progress_error(remove_exc)
+            ):
+                raise
+
+        await self._wait_for_container_release(name, known_container_id=old_id)
 
     async def _resolve_commit_hash(self, repo_id: str, revision: str = "main") -> str:
         token = getattr(self._hf, "_token", None)
@@ -991,6 +1136,7 @@ class ModelRuntimeManager:
         active_model_name: str | None = None,
         active_model_resolved_path: Path | None = None,
         active_model_draft_resolved_path: Path | None = None,
+        active_model_mmproj_resolved_path: Path | None = None,
     ) -> str:
         lines = []
 
@@ -1002,16 +1148,22 @@ class ModelRuntimeManager:
 
             resolved_model_path = None
             resolved_draft_path = None
+            resolved_mmproj_path = None
 
             if m.name == active_model_name:
                 resolved_model_path = active_model_resolved_path
                 resolved_draft_path = active_model_draft_resolved_path
+                resolved_mmproj_path = active_model_mmproj_resolved_path
+                if resolved_mmproj_path is None and rt_cfg.mmproj is not None:
+                    resolved_mmproj_path = self._find_cached_path(rt_cfg.mmproj)
             else:
                 resolved_model_path = self._find_cached_path(rt_cfg.source)
                 if rt_cfg.speculative.draft_model is not None:
                     resolved_draft_path = self._find_cached_path(
                         rt_cfg.speculative.draft_model
                     )
+                if rt_cfg.mmproj is not None:
+                    resolved_mmproj_path = self._find_cached_path(rt_cfg.mmproj)
 
             if resolved_model_path is None:
                 continue
@@ -1033,53 +1185,33 @@ class ModelRuntimeManager:
                     )
                     lines.append(f"model-draft = {draft_p}")
 
+            if rt_cfg.mmproj is not None and resolved_mmproj_path is not None:
+                mmproj_p = self._map_model_path_sync(rt_cfg.mmproj, resolved_mmproj_path)
+                lines.append(f"mmproj = {mmproj_p}")
+
             i = 0
             while i < len(rt_cfg.extra_args):
                 arg = rt_cfg.extra_args[i]
-                if arg.startswith("-") and len(arg) > 1:
-                    if "=" in arg:
-                        parts = arg.split("=", 1)
-                        key_part = parts[0]
-                        val = parts[1]
-                        key = (
-                            key_part[2:] if key_part.startswith("--") else key_part[1:]
-                        )
-                        if key == "mmproj":
-                            mmproj_source = ModelSource(
-                                repo_id=rt_cfg.source.repo_id,
-                                filename=val,
-                                revision=rt_cfg.source.revision,
-                            )
-                            resolved_mmproj = self._find_cached_path(mmproj_source)
-                            if resolved_mmproj is not None:
-                                val = self._map_model_path_sync(
-                                    mmproj_source, resolved_mmproj
-                                )
-                        lines.append(f"{key} = {val}")
-                        i += 1
-                    else:
-                        key = arg[2:] if arg.startswith("--") else arg[1:]
-                        if i + 1 < len(rt_cfg.extra_args) and not rt_cfg.extra_args[
-                            i + 1
-                        ].startswith("-"):
-                            val = rt_cfg.extra_args[i + 1]
-                            if key == "mmproj":
-                                mmproj_source = ModelSource(
-                                    repo_id=rt_cfg.source.repo_id,
-                                    filename=val,
-                                    revision=rt_cfg.source.revision,
-                                )
-                                resolved_mmproj = self._find_cached_path(mmproj_source)
-                                if resolved_mmproj is not None:
-                                    val = self._map_model_path_sync(
-                                        mmproj_source, resolved_mmproj
-                                    )
-                            lines.append(f"{key} = {val}")
-                            i += 2
-                        else:
-                            lines.append(f"{key} = true")
-                            i += 1
+                if not (arg.startswith("-") and len(arg) > 1):
+                    i += 1
+                    continue
+
+                if "=" in arg:
+                    parts = arg.split("=", 1)
+                    key_part = parts[0]
+                    val = parts[1]
+                    key = key_part[2:] if key_part.startswith("--") else key_part[1:]
+                    lines.append(f"{key} = {val}")
+                    i += 1
+                    continue
+
+                key = arg[2:] if arg.startswith("--") else arg[1:]
+                if i + 1 < len(rt_cfg.extra_args) and not rt_cfg.extra_args[i + 1].startswith("-"):
+                    val = rt_cfg.extra_args[i + 1]
+                    lines.append(f"{key} = {val}")
+                    i += 2
                 else:
+                    lines.append(f"{key} = true")
                     i += 1
             lines.append("")
         return "\n".join(lines)
@@ -1111,8 +1243,9 @@ class ModelRuntimeManager:
                 params=request.url.params,
             )
             response = await client.send(upstream, stream=True)
-        except Exception:
+        except Exception as exc:
             await client.aclose()
+            await self.handle_runtime_communication_failure(exc)
             raise
         return ProxySession(client=client, response=response)
 
@@ -1127,9 +1260,32 @@ class ModelRuntimeManager:
             self,
         )
 
+    def _load_last_logs_from_disk(self, model_name: str) -> list[str]:
+        import json
+        try:
+            log_dir = self._runtime.runtime_log_dir.expanduser().resolve()
+            log_path = log_dir / "last_logs" / f"{RuntimeContainer._slugify(model_name)}.json"
+            if log_path.exists():
+                with log_path.open("r", encoding="utf-8") as fh:
+                    return json.load(fh)
+        except Exception as e:
+            logger.warning("Failed to load last logs for model %s from disk: %s", model_name, e)
+        return []
+
     async def get_logs(self, name: str) -> list[str]:
-        if self._active_model_name == name and self._active_runtime is not None:
-            return await self._active_runtime.get_logs()
+        if (
+            self._active_runtime is not None
+            and self._active_runtime.model_name == name
+        ):
+            lines = await self._active_runtime.get_logs()
+            self._logs_cache[name] = lines
+            return lines
+        if name in self._logs_cache:
+            return self._logs_cache[name]
+        lines = self._load_last_logs_from_disk(name)
+        if lines:
+            self._logs_cache[name] = lines
+            return lines
         return []
 
     def find_model_for_name(self, model_name: str) -> str | None:
@@ -1143,19 +1299,57 @@ class ModelRuntimeManager:
             stop_exc = None
             if self._active_runtime is not None:
                 try:
-                    await self._active_runtime.stop()
-                    self._active_runtime = None
-                    self._active_model_name = None
+                    await self._stop_runtime(self._active_runtime)
+                    self._last_error = None
                 except Exception as exc:
                     logger.error(
                         "Failed to stop active runtime during cleanup: %s", exc
                     )
+                    self._last_error = str(exc)
                     stop_exc = exc
 
             await self._cleanup_all_managed_containers()
 
             if stop_exc is not None:
                 raise stop_exc
+
+    async def handle_runtime_communication_failure(self, exc: Exception) -> None:
+        error_message = f"Model runtime communication failure: {exc}"
+        async with self._lock:
+            self._last_error = error_message
+            active_runtime = self._active_runtime
+            if active_runtime is None:
+                return
+
+            active_runtime.state = "error"
+            active_runtime.last_error = error_message
+            await self._discard_runtime(active_runtime)
+
+    async def _stop_runtime(self, runtime_obj: RuntimeContainer) -> None:
+        self._clear_active_runtime(runtime_obj)
+        try:
+            await runtime_obj.stop()
+        finally:
+            self._clear_active_runtime(runtime_obj)
+
+    async def _discard_runtime(self, runtime_obj: RuntimeContainer) -> None:
+        self._clear_active_runtime(runtime_obj)
+        try:
+            await runtime_obj.stop()
+        except Exception as stop_exc:
+            logger.error("Failed to stop runtime during discard: %s", stop_exc)
+            existing_error = runtime_obj.last_error or self._last_error or "unknown error"
+            self._last_error = f"{existing_error}; cleanup failed: {stop_exc}"
+        finally:
+            self._clear_active_runtime(runtime_obj)
+
+    def _clear_active_runtime(self, runtime_obj: RuntimeContainer) -> None:
+        if self._active_runtime is runtime_obj:
+            self._active_runtime = None
+        if self._active_model_name == runtime_obj.model_name:
+            self._active_model_name = None
+        elif self._active_runtime is None:
+            self._active_model_name = None
 
     async def _cleanup_all_managed_containers(self) -> None:
         try:
@@ -1200,13 +1394,22 @@ class ModelRuntimeManager:
                     logger.info("Cleaning up container: %s", container.name)
                     try:
                         await asyncio.to_thread(container.stop, timeout=5)
+                    except docker.errors.NotFound:
+                        pass
                     except Exception as stop_exc:
-                        logger.warning(
-                            "Stop failed for container %s: %s",
-                            container.name,
-                            stop_exc,
-                        )
-                    await asyncio.to_thread(container.remove, force=True)
+                        if not self._is_removal_in_progress_error(stop_exc):
+                            logger.warning(
+                                "Stop failed for container %s: %s",
+                                container.name,
+                                stop_exc,
+                            )
+                    try:
+                        await asyncio.to_thread(container.remove, force=True)
+                    except docker.errors.NotFound:
+                        pass
+                    except Exception as remove_exc:
+                        if not self._is_removal_in_progress_error(remove_exc):
+                            raise
                 except Exception as exc:
                     logger.warning(
                         "Failed to clean up container %s: %s",

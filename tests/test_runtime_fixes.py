@@ -337,8 +337,8 @@ async def test_load_retries_by_restarting_after_failed_runtime_start(
     with pytest.raises(RuntimeError, match="initial startup failed"):
         await manager.load("primary", "rocm")
 
-    assert manager._active_runtime is not None
-    assert manager._active_runtime.state == "error"
+    assert manager._active_runtime is None
+    assert manager.status().last_error == "initial startup failed"
 
     status = await manager.load("primary", "rocm")
 
@@ -430,9 +430,9 @@ async def test_proxy_canonical_model_key(
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
-        # Requesting when nothing is loaded should fail
+        # With autoload, requesting an inactive model now succeeds
         res = await client.post("/api/v1/chat/completions", json={"model": "gemma"})
-        assert res.status_code == 400
+        assert res.status_code == 200
 
         # Load model
         await manager.load("gemma", "rocm")
@@ -660,8 +660,8 @@ async def test_runtime_load_failure_state_correctness(
         await manager.load("gemma", "rocm")
 
     assert manager._active_model_name is None
-    assert manager._active_runtime is not None
-    assert manager._active_runtime.state == "error"
+    assert manager._active_runtime is None
+    assert manager.status().last_error == "Load crash"
 
 
 @pytest.mark.asyncio
@@ -729,8 +729,8 @@ async def test_runtime_swap_failure_leaves_honest_state(
         await manager.load("model_b", "rocm")
 
     assert manager._active_model_name is None
-    assert manager._active_runtime is not None
-    assert manager._active_runtime.state == "error"
+    assert manager._active_runtime is None
+    assert manager.status().last_error == "Swap failure"
 
 
 @pytest.mark.asyncio
@@ -913,7 +913,7 @@ async def test_cleanup_removes_even_if_stop_fails(
 
 
 @pytest.mark.asyncio
-async def test_runtime_unload_failure_state_handling(
+async def test_runtime_switch_does_not_depend_on_internal_unload_endpoint(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1034,15 +1034,14 @@ async def test_runtime_unload_failure_state_handling(
     await manager.load("model_old", "rocm")
     assert manager.status().active_model == "model_old"
 
-    with pytest.raises(RuntimeError) as exc_info:
-        await manager.load("model_new", "rocm")
-    assert "Failed to unload model inside" in str(exc_info.value)
+    loaded = await manager.load("model_new", "rocm")
+    assert loaded.name == "model_new"
 
     svc_status = manager.status()
-    assert svc_status.healthy is False
-    assert svc_status.active_model is None
+    assert svc_status.healthy is True
+    assert svc_status.active_model == "model_new"
 
-    statuses = {s.name: s for s in svc_status.models}
-    assert statuses["model_old"].state == "error"
-    assert statuses["model_old"].last_error is not None
-    assert "Failed to unload model inside" in statuses["model_old"].last_error
+    statuses = {s.name: s.status for s in manager.model_resources()}
+    assert statuses["model_old"].state == "stopped"
+    assert statuses["model_old"].last_error is None
+    assert statuses["model_new"].state == "running"

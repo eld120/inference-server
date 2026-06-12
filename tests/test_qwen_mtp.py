@@ -146,13 +146,12 @@ async def test_qwen_combined_vision_mtp_presets_ini(tmp_path: Path) -> None:
                 repo_id="unsloth/Qwen3.6-27B-MTP-GGUF",
                 filename="Qwen3.6-27B-UD-Q4_K_XL.gguf",
             ),
+            mmproj=ModelSource(
+                repo_id="unsloth/Qwen3.6-27B-MTP-GGUF",
+                filename="mmproj-BF16.gguf",
+            ),
             speculative={"type": "draft-mtp"},  # type: ignore[arg-type]
-            extra_args=[
-                "--mmproj",
-                "mmproj-BF16.gguf",
-                "--spec-draft-n-max",
-                "2",
-            ],
+            extra_args=["--spec-draft-n-max", "2"],
         ),
         hf_cache_dir=cache_dir,
     )
