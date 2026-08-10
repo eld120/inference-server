@@ -23,7 +23,7 @@ uv run ty check
 
 The runtime containers are built from vendored Dockerfiles in [`docker/`](../docker).
 Both recipes fetch `llama.cpp` from the pinned upstream commit
-`7e50ef7d79f7fb5f957e378111f7cf38c0929d46` during the Docker build.
+`ebc10770ac5a9331824c53ef0c6adad780904dc3` during the Docker build.
 
 Build the ROCm server image:
 
@@ -41,7 +41,7 @@ Build the Vulkan server image:
 docker build \
   -f docker/llama-vulkan.Dockerfile \
   --target server \
-  -t inference-server-llama-vulkan:26.04-7e50ef7 \
+  -t inference-server-llama-vulkan:26.04-ebc1077 \
   .
 ```
 

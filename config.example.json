@@ -26,7 +26,7 @@
       ]
     },
     "vulkan": {
-      "docker_image": "inference-server-llama-vulkan:26.04-7e50ef7",
+      "docker_image": "inference-server-llama-vulkan:26.04-ebc1077",
       "devices": [
         "/dev/dri"
       ],
@@ -137,6 +137,48 @@
         "repo_id": "ebircak/gemma-4-31B-it-GGUF",
         "filename": "mmproj-gemma-4-31B-it-q8_0.gguf",
         "revision": "main"
+      }
+    },
+    {
+      "name": "gemma-4-31b-vision-mtp-example",
+      "source": {
+        "repo_id": "unsloth/gemma-4-31B-it-GGUF",
+        "filename": "gemma-4-31B-it-UD-Q4_K_XL.gguf",
+        "revision": "main"
+      },
+      "mmproj": {
+        "repo_id": "unsloth/gemma-4-31B-it-GGUF",
+        "filename": "mmproj-BF16.gguf",
+        "revision": "main"
+      },
+      "speculative": {
+        "type": "draft",
+        "draft_model": {
+          "repo_id": "unsloth/gemma-4-31B-it-GGUF",
+          "filename": "mtp-gemma-4-31B-it.gguf",
+          "revision": "main"
+        }
+      }
+    },
+    {
+      "name": "gemma-4-26b-vision-mtp-example",
+      "source": {
+        "repo_id": "unsloth/gemma-4-26B-A4B-it-GGUF",
+        "filename": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+        "revision": "main"
+      },
+      "mmproj": {
+        "repo_id": "unsloth/gemma-4-26B-A4B-it-GGUF",
+        "filename": "mmproj-BF16.gguf",
+        "revision": "main"
+      },
+      "speculative": {
+        "type": "draft",
+        "draft_model": {
+          "repo_id": "unsloth/gemma-4-26B-A4B-it-GGUF",
+          "filename": "mtp-gemma-4-26B-A4B-it.gguf",
+          "revision": "main"
+        }
       }
     }
   ]
