@@ -44,6 +44,7 @@ Behavior:
 - If another model is currently active, its runtime container is stopped and removed before the new one starts.
 - A successful response means the model is ready to accept proxied `/api/v1/*` requests immediately.
 - You do not need to call this endpoint before every inference request if the request already names a configured model. The proxy will activate it on demand.
+- On explicit `POST /load`, the client chooses the runtime. On implicit proxy auto-load, the server picks a default runtime for that model and now prefers `vulkan` when both `vulkan` and `rocm` are configured.
 
 #### Response Example
 ```json

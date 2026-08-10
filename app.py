@@ -87,8 +87,16 @@ def _preferred_runtime_for_model(
     if model_config is None:
         return None
     if model_config.runtimes:
+        if "vulkan" in model_config.runtimes:
+            return "vulkan"
+        if "rocm" in model_config.runtimes:
+            return "rocm"
         return next(iter(model_config.runtimes))
     if app_config.backends:
+        if "vulkan" in app_config.backends:
+            return "vulkan"
+        if "rocm" in app_config.backends:
+            return "rocm"
         return next(iter(app_config.backends))
     return None
 
