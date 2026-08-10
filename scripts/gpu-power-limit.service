@@ -1,0 +1,11 @@
+[Unit]
+Description=Set GPU Power Limit to 225W on Boot
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/set-gpu-power.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
