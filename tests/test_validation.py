@@ -57,8 +57,17 @@ def test_speculative_draft_with_draft_model_ok() -> None:
     assert config.draft_model is not None
 
 
-def test_speculative_self_contained_types_with_draft_model_rejected() -> None:
-    types_val: list[Any] = ["none", "draft-mtp", "ngram-cache"]
+def test_speculative_draft_mtp_with_draft_model_ok() -> None:
+    config = SpeculativeConfig(
+        type="draft-mtp",
+        draft_model=ModelSource(local_path=Path("/models/draft.gguf")),
+    )
+    assert config.type == "draft-mtp"
+    assert config.draft_model is not None
+
+
+def test_speculative_non_draft_types_with_draft_model_rejected() -> None:
+    types_val: list[Any] = ["none", "ngram-cache"]
     for type_val in types_val:
         with pytest.raises(ValueError, match=f"speculative type is '{type_val}'"):
             SpeculativeConfig(
@@ -643,4 +652,3 @@ def test_legacy_mmproj_normalization() -> None:
     assert cfg_repo.mmproj is not None
     assert cfg_repo.mmproj.repo_id == "org/model"
     assert cfg_repo.mmproj.filename == "mmproj.gguf"
-

@@ -90,7 +90,7 @@ Supported speculative types:
 - `none`
 - `draft` (Requires `draft_model`, typically used for separate assistant models like Gemma 4 Assistant)
 - `draft-simple` (Requires `draft_model`)
-- `draft-mtp` (Self-contained Multi-Token Prediction, e.g., for Qwen 3.6 MTP models)
+- `draft-mtp` (Multi-Token Prediction; Qwen 3.6 MTP GGUFs contain their own MTP head and must not set `draft_model`, while Gemma 4 uses a separate `mtp-gemma-*.gguf` draft artifact, which may be packaged in the same Hugging Face repository)
 - `ngram-cache`
 - `ngram-simple`
 - `ngram-map-k`

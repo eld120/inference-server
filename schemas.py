@@ -123,7 +123,11 @@ class SpeculativeConfig(BaseModel):
                 f"to be configured"
             )
             raise ValueError(msg)
-        if self.type not in _DRAFT_MODEL_TYPES and self.draft_model is not None:
+        if (
+            self.type not in _DRAFT_MODEL_TYPES
+            and self.type not in _SELF_CONTAINED_TYPES
+            and self.draft_model is not None
+        ):
             msg = (
                 f"draft_model is configured but speculative type is '{self.type}'; "
                 f"set a speculative type that uses a draft model or remove draft_model"

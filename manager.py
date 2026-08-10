@@ -1175,7 +1175,10 @@ class ModelRuntimeManager:
             lines.append(f"model = {container_path}")
 
             if rt_cfg.speculative.type != "none":
-                lines.append(f"spec-type = {rt_cfg.speculative.type}")
+                spec_type = rt_cfg.speculative.type
+                if spec_type == "draft":
+                    spec_type = "draft-simple"
+                lines.append(f"spec-type = {spec_type}")
                 if (
                     rt_cfg.speculative.draft_model is not None
                     and resolved_draft_path is not None
