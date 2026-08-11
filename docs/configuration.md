@@ -58,7 +58,7 @@ These backend definitions are reused as configuration templates, but the runtime
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `docker_image` | `string` | Required | Container image to run (e.g. `inference-server-llama-rocm:7.2.1-7e50ef7`). |
+| `docker_image` | `string` | Required | Container image to run (e.g. `inference-server-llama-rocm:7.2.1-0666ad2`). |
 | `devices` | `string[]` | `[]` | Device nodes passed through to the container. |
 | `volumes` | `object` | `{}` | Host-to-container mount paths. |
 | `shared_args` | `string[]` | `[]` | Global llama.cpp options. |
@@ -90,6 +90,7 @@ Supported speculative types:
 - `none`
 - `draft` (Requires `draft_model`, typically used for separate assistant models like Gemma 4 Assistant)
 - `draft-simple` (Requires `draft_model`)
+- `draft-dflash` (Requires a DFlash `draft_model`, such as Muse Glimmer's `dflash-kquant.gguf`)
 - `draft-mtp` (Multi-Token Prediction; Qwen 3.6 MTP GGUFs contain their own MTP head and must not set `draft_model`, while Gemma 4 uses a separate `mtp-gemma-*.gguf` draft artifact, which may be packaged in the same Hugging Face repository)
 - `ngram-cache`
 - `ngram-simple`

@@ -49,11 +49,25 @@ def test_speculative_draft_simple_requires_draft_model() -> None:
         SpeculativeConfig(type="draft-simple")
 
 
+def test_speculative_dflash_requires_draft_model() -> None:
+    with pytest.raises(ValueError, match="requires a draft_model"):
+        SpeculativeConfig(type="draft-dflash")
+
+
 def test_speculative_draft_with_draft_model_ok() -> None:
     config = SpeculativeConfig(
         type="draft",
         draft_model=ModelSource(local_path=Path("/models/draft.gguf")),
     )
+    assert config.draft_model is not None
+
+
+def test_speculative_dflash_with_draft_model_ok() -> None:
+    config = SpeculativeConfig(
+        type="draft-dflash",
+        draft_model=ModelSource(local_path=Path("/models/dflash.gguf")),
+    )
+    assert config.type == "draft-dflash"
     assert config.draft_model is not None
 
 

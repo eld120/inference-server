@@ -16,6 +16,7 @@ SpeculativeType = Literal[
     "none",
     "draft",
     "draft-simple",
+    "draft-dflash",
     "draft-mtp",
     "ngram-cache",
     "ngram-simple",
@@ -103,7 +104,7 @@ def _normalize_mmproj_args(
 
 
 # Speculative types that require a separate draft model
-_DRAFT_MODEL_TYPES: set[SpeculativeType] = {"draft", "draft-simple"}
+_DRAFT_MODEL_TYPES: set[SpeculativeType] = {"draft", "draft-simple", "draft-dflash"}
 
 # Speculative types that are self-contained (no draft model needed)
 _SELF_CONTAINED_TYPES: set[SpeculativeType] = {"draft-mtp"}
