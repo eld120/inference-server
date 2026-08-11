@@ -3,7 +3,7 @@
   "hf_cache_dir": "~/.cache/huggingface/hub",
   "backends": {
     "rocm": {
-      "docker_image": "inference-server-llama-rocm:7.2.1-7e50ef7",
+      "docker_image": "inference-server-llama-rocm:7.2.1-0666ad2",
       "devices": [
         "/dev/kfd",
         "/dev/dri"
@@ -26,7 +26,7 @@
       ]
     },
     "vulkan": {
-      "docker_image": "inference-server-llama-vulkan:26.04-ebc1077",
+      "docker_image": "inference-server-llama-vulkan:26.04-0666ad2",
       "devices": [
         "/dev/dri"
       ],
@@ -178,6 +178,81 @@
           "repo_id": "unsloth/gemma-4-26B-A4B-it-GGUF",
           "filename": "mtp-gemma-4-26B-A4B-it.gguf",
           "revision": "main"
+        }
+      }
+    },
+    {
+      "name": "muse-glimmer-30b-q4",
+      "source": {
+        "repo_id": "unsloth/Muse-Glimmer-30B-GGUF",
+        "filename": "Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
+        "revision": "faa5b025c584459c13febfa5c59883516710ae39"
+      },
+      "mmproj": {
+        "repo_id": "unsloth/Muse-Glimmer-30B-GGUF",
+        "filename": "mmproj-kquant.gguf",
+        "revision": "faa5b025c584459c13febfa5c59883516710ae39"
+      },
+      "extra_args": [
+        "--spec-draft-n-max",
+        "15"
+      ],
+      "speculative": {
+        "type": "draft-dflash",
+        "draft_model": {
+          "repo_id": "unsloth/Muse-Glimmer-30B-GGUF",
+          "filename": "dflash-kquant.gguf",
+          "revision": "faa5b025c584459c13febfa5c59883516710ae39"
+        }
+      }
+    },
+    {
+      "name": "muse-glimmer-30b-q5",
+      "source": {
+        "repo_id": "unsloth/Muse-Glimmer-30B-GGUF",
+        "filename": "Muse-Glimmer-30B-UD-Q5_K_XL.gguf",
+        "revision": "faa5b025c584459c13febfa5c59883516710ae39"
+      },
+      "mmproj": {
+        "repo_id": "unsloth/Muse-Glimmer-30B-GGUF",
+        "filename": "mmproj-kquant.gguf",
+        "revision": "faa5b025c584459c13febfa5c59883516710ae39"
+      },
+      "extra_args": [
+        "--spec-draft-n-max",
+        "15"
+      ],
+      "speculative": {
+        "type": "draft-dflash",
+        "draft_model": {
+          "repo_id": "unsloth/Muse-Glimmer-30B-GGUF",
+          "filename": "dflash-kquant.gguf",
+          "revision": "faa5b025c584459c13febfa5c59883516710ae39"
+        }
+      }
+    },
+    {
+      "name": "muse-glimmer-30b-q6",
+      "source": {
+        "repo_id": "unsloth/Muse-Glimmer-30B-GGUF",
+        "filename": "Muse-Glimmer-30B-UD-Q6_K_XL.gguf",
+        "revision": "faa5b025c584459c13febfa5c59883516710ae39"
+      },
+      "mmproj": {
+        "repo_id": "unsloth/Muse-Glimmer-30B-GGUF",
+        "filename": "mmproj-kquant.gguf",
+        "revision": "faa5b025c584459c13febfa5c59883516710ae39"
+      },
+      "extra_args": [
+        "--spec-draft-n-max",
+        "15"
+      ],
+      "speculative": {
+        "type": "draft-dflash",
+        "draft_model": {
+          "repo_id": "unsloth/Muse-Glimmer-30B-GGUF",
+          "filename": "dflash-kquant.gguf",
+          "revision": "faa5b025c584459c13febfa5c59883516710ae39"
         }
       }
     }
