@@ -1,0 +1,154 @@
+{
+    "name": "Turbofan",
+    "vendor": "customendpoint",
+    "apiType": "chat-completions",
+    "models": [
+        {
+            "id": "qwen3.6-27b-q4-mtp",
+            "name": "Qwen 3.6 27B MTP (4-bit)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": false,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "qwen3.6-27b-q4",
+            "name": "Qwen 3.6 27B (4-bit)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": true,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "qwen3.6-27b-q5-mtp",
+            "name": "Qwen 3.6 27B MTP (5-bit)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": false,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "qwen3.6-27b-q5",
+            "name": "Qwen 3.6 27B (5-bit)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": true,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "qwen3.6-27b-q6-mtp",
+            "name": "Qwen 3.6 27B MTP (6-bit)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": false,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "qwen3.6-27b-q6",
+            "name": "Qwen 3.6 27B (6-bit)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": true,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "qwen3.6-35b-q4-mtp",
+            "name": "Qwen 3.6 35B MTP (4-bit)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": false,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "qwen3.6-35b-q4",
+            "name": "Qwen 3.6 35B (4-bit)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": true,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "gemma-4-26b-q4",
+            "name": "Gemma 4 26B (4-bit)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": true,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "gemma-4-26b-q5",
+            "name": "Gemma 4 26B (5-bit)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": true,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "gemma-4-26b-q6",
+            "name": "Gemma 4 26B (6-bit)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": true,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "gemma-4-31b-q4",
+            "name": "Gemma 4 31B (4-bit)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": true,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "gemma-4-31b-q5",
+            "name": "Gemma 4 31B (5-bit)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": true,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "muse-glimmer-30b-q4",
+            "name": "Muse Glimmer 30B (4-bit, DFlash)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": true,
+            "thinking": true,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "muse-glimmer-30b-q5",
+            "name": "Muse Glimmer 30B (5-bit, DFlash)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": true,
+            "thinking": true,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        },
+        {
+            "id": "muse-glimmer-30b-q6",
+            "name": "Muse Glimmer 30B (6-bit, DFlash)",
+            "url": "http://192.168.0.42:8585/api/v1/chat/completions",
+            "toolCalling": true,
+            "vision": true,
+            "thinking": true,
+            "maxInputTokens": 96000,
+            "maxOutputTokens": 16000
+        }
+    ]
+}
