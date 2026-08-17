@@ -8,7 +8,7 @@ from fastapi import Request as FastAPIRequest
 from httpx import ASGITransport, AsyncClient
 from httpx import Request as HTTPXRequest
 
-from app import create_app
+from app import _apply_model_request_parameters, create_app
 from manager import ProxySession
 from protocols import ActiveModelProtocol
 from schemas import (
@@ -111,6 +111,45 @@ class FakeManager:
         )
         response = await client.send(upstream_request, stream=True)
         return ProxySession(client=client, response=response)
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "xhigh"])
+def test_qwen_38_uses_native_reasoning_effort(effort: str) -> None:
+    data: dict[str, object] = {"reasoning_effort": effort}
+
+    _apply_model_request_parameters(data, "qwen3.8-27b-q5-mtp")
+
+    assert data["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "reasoning_effort": effort,
+    }
+    assert "thinking_budget_tokens" not in data
+
+
+def test_qwen_38_accepts_nested_effort_and_high_alias() -> None:
+    data: dict[str, object] = {"reasoning": {"effort": "high"}}
+
+    _apply_model_request_parameters(data, "qwen3.8-27b-q4")
+
+    assert data["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "reasoning_effort": "xhigh",
+    }
+
+
+def test_qwen_38_none_disables_thinking_without_a_budget() -> None:
+    data: dict[str, object] = {"reasoning_effort": "none"}
+
+    _apply_model_request_parameters(data, "qwen3.8-27b-q6")
+
+    assert data["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_qwen_38_rejects_unknown_reasoning_effort() -> None:
+    with pytest.raises(ValueError, match="not supported"):
+        _apply_model_request_parameters(
+            {"reasoning_effort": "minimal"}, "qwen3.8-27b-q4-mtp"
+        )
 
 
 class LoadingManager(FakeManager):

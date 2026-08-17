@@ -152,7 +152,7 @@ def test_no_runtimes_rejected() -> None:
 
 
 def test_unknown_runtime_key_rejected() -> None:
-    with pytest.raises(ValidationError, match="should be 'rocm' or 'vulkan'"):
+    with pytest.raises(ValidationError, match="Input should be"):
         ModelConfig.model_validate(
             {
                 "name": "gemma",
@@ -164,6 +164,7 @@ def test_unknown_runtime_key_rejected() -> None:
                 },
             }
         )
+
 
 
 def test_model_source_repo_id_without_filename_rejected() -> None:

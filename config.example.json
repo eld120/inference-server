@@ -46,9 +46,43 @@
         "--cache-type-v",
         "q8_0"
       ]
+    },
+    "sd-rocm": {
+      "docker_image": "inference-server-sd-rocm:7.2.4-master",
+      "devices": [
+        "/dev/kfd",
+        "/dev/dri"
+      ],
+      "shared_args": []
+    },
+    "sd-vulkan": {
+      "docker_image": "inference-server-sd-vulkan:24.04-master",
+      "devices": [
+        "/dev/dri"
+      ],
+      "shared_args": []
     }
   },
   "models": [
+    {
+      "name": "qwen-image",
+      "task": "image_generation",
+      "source": {
+        "repo_id": "Qwen/Qwen-Image",
+        "filename": "qwen_image_q4_k_m.gguf",
+        "revision": "main"
+      }
+    },
+    {
+      "name": "minimax-h3",
+      "task": "video_generation",
+      "source": {
+        "repo_id": "molbal/MiniMax-H3-GGUF",
+        "filename": "MiniMax-H3-Q4_K_M.gguf",
+        "revision": "main"
+      }
+    },
+
     {
       "name": "qwen3.6-27b-mtp-example",
       "source": {

@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, timezone
 
 logger = logging.getLogger("inference-server.app")
 from contextlib import asynccontextmanager
@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from config import RuntimeSettings, effective_hf_token, load_app_config
 from hf import HuggingFaceService
 from manager import ModelRuntimeManager
-from protocols import ModelRuntimeManagerProtocol, HuggingFaceServiceProtocol
+from protocols import HuggingFaceServiceProtocol, ModelRuntimeManagerProtocol
 from schemas import (
     AppConfig,
     HealthResponse,
@@ -42,6 +42,9 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
     "content-length",
 }
+
+QWEN_38_MODEL_PREFIX = "qwen3.8-27b"
+QWEN_38_REASONING_EFFORTS = frozenset({"low", "medium", "xhigh"})
 
 
 def _filtered_headers(headers: httpx.Headers) -> dict[str, str]:
@@ -86,23 +89,81 @@ def _preferred_runtime_for_model(
     model_config = _manager_find_model_config(manager, model_name)
     if model_config is None:
         return None
+
+    is_diffusion = model_config.task in {
+        "image_generation",
+        "image_edit",
+        "video_generation",
+    }
+
     if model_config.runtimes:
-        if "vulkan" in model_config.runtimes:
-            return "vulkan"
-        if "rocm" in model_config.runtimes:
-            return "rocm"
+        if is_diffusion:
+            for pref in ("sd-vulkan", "sd-rocm", "vulkan", "rocm"):
+                if pref in model_config.runtimes:
+                    return pref
+        else:
+            for pref in ("vulkan", "rocm", "sd-vulkan", "sd-rocm"):
+                if pref in model_config.runtimes:
+                    return pref
         return next(iter(model_config.runtimes))
+
     if app_config.backends:
-        if "vulkan" in app_config.backends:
-            return "vulkan"
-        if "rocm" in app_config.backends:
-            return "rocm"
+        if is_diffusion:
+            for pref in ("sd-vulkan", "sd-rocm", "vulkan", "rocm"):
+                if pref in app_config.backends:
+                    return pref
+        else:
+            for pref in ("vulkan", "rocm", "sd-vulkan", "sd-rocm"):
+                if pref in app_config.backends:
+                    return pref
         return next(iter(app_config.backends))
     return None
 
 
+def _apply_model_request_parameters(
+    data: dict[str, object], model_name: str
+) -> None:
+    """Translate public request fields into model-native chat-template kwargs."""
+    if not model_name.startswith(QWEN_38_MODEL_PREFIX):
+        return
+
+    effort = data.get("reasoning_effort")
+    reasoning = data.get("reasoning")
+    if effort is None and isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+    if effort is None:
+        return
+    if not isinstance(effort, str):
+        raise ValueError("reasoning effort must be a string")
+
+    # Qwen 3.8's template accepts `high` as a compatibility alias for `xhigh`.
+    effort = "xhigh" if effort == "high" else effort
+    if effort not in QWEN_38_REASONING_EFFORTS and effort != "none":
+        allowed = ", ".join((*sorted(QWEN_38_REASONING_EFFORTS), "none"))
+        raise ValueError(
+            f"Qwen 3.8 reasoning effort '{effort}' is not supported; "
+            f"expected one of: {allowed}"
+        )
+
+    kwargs = data.get("chat_template_kwargs")
+    if kwargs is None:
+        kwargs = {}
+        data["chat_template_kwargs"] = kwargs
+    if not isinstance(kwargs, dict):
+        raise ValueError("chat_template_kwargs must be an object")
+
+    if effort == "none":
+        kwargs.pop("reasoning_effort", None)
+        kwargs["enable_thinking"] = False
+    else:
+        kwargs["enable_thinking"] = True
+        kwargs["reasoning_effort"] = effort
+
+
+
+
 async def increment_inflight_requests(app: FastAPI) -> None:
-    start_time = datetime.now(timezone.utc)
+    start_time = datetime.now(UTC)
     async with app.state.observability_lock:
         app.state.inflight_requests += 1
         if app.state.inflight_requests == 1:
@@ -129,7 +190,7 @@ async def increment_inflight_requests(app: FastAPI) -> None:
 
 
 async def decrement_inflight_requests(app: FastAPI) -> None:
-    end_time = datetime.now(timezone.utc)
+    end_time = datetime.now(UTC)
     async with app.state.observability_lock:
         app.state.inflight_requests -= 1
         if app.state.inflight_requests < 0:
@@ -196,7 +257,7 @@ def create_app(
             if tasks:
                 try:
                     await asyncio.wait_for(asyncio.gather(*list(tasks), return_exceptions=True), timeout=5.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning("Timeout waiting for pending observability tasks to finish on shutdown.")
                 except Exception as exc:
                     logger.exception("Error waiting for pending observability tasks on shutdown: %s", exc)
@@ -373,8 +434,11 @@ def create_app(
                 try:
                     import json
 
+                    _apply_model_request_parameters(data, target_model)
                     data["model"] = target_model
                     body = json.dumps(data).encode("utf-8")
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
                 except Exception:
                     pass
 
@@ -410,13 +474,19 @@ def create_app(
                         async for chunk in upstream_response.aiter_raw():
                             yield chunk
                     except Exception as exc:
-                        await manager.handle_runtime_communication_failure(exc)
+                        fail_coro = manager.handle_runtime_communication_failure(exc)
+                        if asyncio.iscoroutine(fail_coro) or hasattr(fail_coro, "__await__"):
+                            await fail_coro
                         raise
                     finally:
                         try:
-                            await asyncio.shield(upstream_response.aclose())
+                            close_coro = upstream_response.aclose()
+                            if asyncio.iscoroutine(close_coro) or hasattr(close_coro, "__await__"):
+                                await asyncio.shield(close_coro)
                         finally:
-                            await asyncio.shield(session.client.aclose())
+                            client_close = session.client.aclose()
+                            if asyncio.iscoroutine(client_close) or hasattr(client_close, "__await__"):
+                                await asyncio.shield(client_close)
                         await asyncio.shield(decrement_inflight_requests(app))
 
                 is_streaming = True
@@ -436,19 +506,27 @@ def create_app(
                     media_type=content_type or None,
                 )
             except Exception as exc:
-                await manager.handle_runtime_communication_failure(exc)
+                fail_coro = manager.handle_runtime_communication_failure(exc)
+                if asyncio.iscoroutine(fail_coro) or hasattr(fail_coro, "__await__"):
+                    await fail_coro
                 raise HTTPException(
                     status_code=503,
                     detail=f"Model runtime communication failure: {exc}",
                 ) from exc
             finally:
                 try:
-                    await asyncio.shield(upstream_response.aclose())
+                    close_coro = upstream_response.aclose()
+                    if asyncio.iscoroutine(close_coro) or hasattr(close_coro, "__await__"):
+                        await asyncio.shield(close_coro)
                 finally:
-                    await asyncio.shield(session.client.aclose())
+                    client_close = session.client.aclose()
+                    if asyncio.iscoroutine(client_close) or hasattr(client_close, "__await__"):
+                        await asyncio.shield(client_close)
+
         finally:
             if incremented and not is_streaming:
                 await asyncio.shield(decrement_inflight_requests(app))
+
 
     @app.get(f"{api_prefix}/v1/models", response_model=OpenAIModelListResponse)
     async def list_v1_models() -> OpenAIModelListResponse:
@@ -502,5 +580,13 @@ def create_app(
     )
     async def api_v1_proxy(request: Request, path: str) -> Response:
         return await _proxy(request, f"v1/{path}")
+
+    @app.api_route(
+        f"{api_prefix}/sdapi/{{path:path}}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        include_in_schema=False,
+    )
+    async def sdapi_proxy(request: Request, path: str) -> Response:
+        return await _proxy(request, f"sdapi/{path}")
 
     return app

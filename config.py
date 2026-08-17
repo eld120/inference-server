@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from schemas import AppConfig
+from schemas import AppConfig, ModelSource
 
 
 def default_config_path() -> Path:
@@ -46,6 +47,24 @@ class RuntimeSettings(BaseSettings):
     )
 
 
+def _normalize_source(source: ModelSource | None, config_dir: Path) -> None:
+    if source is not None and source.local_path is not None:
+        lp = source.local_path
+        if not lp.is_absolute():
+            source._original_local_path_is_relative = True
+            source.local_path = (config_dir / lp).resolve().absolute()
+        else:
+            source.local_path = lp.resolve().absolute()
+
+
+def _serialize_source(source: ModelSource | None, orig_source: ModelSource | None, config_dir: Path) -> None:
+    if source is not None and source.local_path is not None and orig_source is not None:
+        is_rel = getattr(orig_source, "_original_local_path_is_relative", False)
+        if is_rel:
+            lp = source.local_path.resolve().absolute()
+            source.local_path = Path(os.path.relpath(lp, config_dir))
+
+
 def load_app_config(path: Path) -> AppConfig:
     if not path.exists():
         return AppConfig()
@@ -54,55 +73,24 @@ def load_app_config(path: Path) -> AppConfig:
 
     config_dir = path.parent.resolve().absolute()
     for m in config.models:
-        if m.source is not None and m.source.local_path is not None:
-            lp = m.source.local_path
-            if not lp.is_absolute():
-                m.source._original_local_path_is_relative = True
-                m.source.local_path = (config_dir / lp).resolve().absolute()
-            else:
-                m.source.local_path = lp.resolve().absolute()
-        if m.mmproj is not None and m.mmproj.local_path is not None:
-            lp = m.mmproj.local_path
-            if not lp.is_absolute():
-                m.mmproj._original_local_path_is_relative = True
-                m.mmproj.local_path = (config_dir / lp).resolve().absolute()
-            else:
-                m.mmproj.local_path = lp.resolve().absolute()
-        if m.speculative.draft_model is not None and m.speculative.draft_model.local_path is not None:
-            lp = m.speculative.draft_model.local_path
-            if not lp.is_absolute():
-                m.speculative.draft_model._original_local_path_is_relative = True
-                m.speculative.draft_model.local_path = (config_dir / lp).resolve().absolute()
-            else:
-                m.speculative.draft_model.local_path = lp.resolve().absolute()
+        _normalize_source(m.source, config_dir)
+        _normalize_source(m.mmproj, config_dir)
+        _normalize_source(m.vae, config_dir)
+        _normalize_source(m.clip_l, config_dir)
+        _normalize_source(m.t5xxl, config_dir)
+        _normalize_source(m.clip_vision, config_dir)
+        _normalize_source(m.control_net, config_dir)
+        _normalize_source(m.speculative.draft_model, config_dir)
 
         for rt in m.runtimes.values():
-            if rt.source.local_path is not None:
-                lp = rt.source.local_path
-                if not lp.is_absolute():
-                    rt.source._original_local_path_is_relative = True
-                    rt.source.local_path = (config_dir / lp).resolve().absolute()
-                else:
-                    rt.source.local_path = lp.resolve().absolute()
-            if rt.mmproj is not None and rt.mmproj.local_path is not None:
-                lp = rt.mmproj.local_path
-                if not lp.is_absolute():
-                    rt.mmproj._original_local_path_is_relative = True
-                    rt.mmproj.local_path = (config_dir / lp).resolve().absolute()
-                else:
-                    rt.mmproj.local_path = lp.resolve().absolute()
-            if (
-                rt.speculative.draft_model is not None
-                and rt.speculative.draft_model.local_path is not None
-            ):
-                lp = rt.speculative.draft_model.local_path
-                if not lp.is_absolute():
-                    rt.speculative.draft_model._original_local_path_is_relative = True
-                    rt.speculative.draft_model.local_path = (
-                        config_dir / lp
-                    ).resolve().absolute()
-                else:
-                    rt.speculative.draft_model.local_path = lp.resolve().absolute()
+            _normalize_source(rt.source, config_dir)
+            _normalize_source(rt.mmproj, config_dir)
+            _normalize_source(rt.vae, config_dir)
+            _normalize_source(rt.clip_l, config_dir)
+            _normalize_source(rt.t5xxl, config_dir)
+            _normalize_source(rt.clip_vision, config_dir)
+            _normalize_source(rt.control_net, config_dir)
+            _normalize_source(rt.speculative.draft_model, config_dir)
     return config
 
 
@@ -112,57 +100,26 @@ def save_app_config(path: Path, config: AppConfig) -> None:
     config_dir = path.parent.resolve().absolute()
     for m_idx, m in enumerate(config_copy.models):
         orig_model = config.models[m_idx]
-        if m.source is not None and m.source.local_path is not None:
-            is_rel = getattr(orig_model.source, "_original_local_path_is_relative", False)
-            if is_rel:
-                lp = m.source.local_path.resolve().absolute()
-                import os
-                m.source.local_path = Path(os.path.relpath(lp, config_dir))
-        if m.mmproj is not None and m.mmproj.local_path is not None:
-            is_rel = getattr(orig_model.mmproj, "_original_local_path_is_relative", False)
-            if is_rel:
-                lp = m.mmproj.local_path.resolve().absolute()
-                import os
-                m.mmproj.local_path = Path(os.path.relpath(lp, config_dir))
-        if m.speculative.draft_model is not None and m.speculative.draft_model.local_path is not None:
-            is_rel = getattr(
-                orig_model.speculative.draft_model,
-                "_original_local_path_is_relative",
-                False,
-            )
-            if is_rel:
-                lp = m.speculative.draft_model.local_path.resolve().absolute()
-                import os
-                m.speculative.draft_model.local_path = Path(os.path.relpath(lp, config_dir))
+        _serialize_source(m.source, orig_model.source, config_dir)
+        _serialize_source(m.mmproj, orig_model.mmproj, config_dir)
+        _serialize_source(m.vae, orig_model.vae, config_dir)
+        _serialize_source(m.clip_l, orig_model.clip_l, config_dir)
+        _serialize_source(m.t5xxl, orig_model.t5xxl, config_dir)
+        _serialize_source(m.clip_vision, orig_model.clip_vision, config_dir)
+        _serialize_source(m.control_net, orig_model.control_net, config_dir)
+        _serialize_source(m.speculative.draft_model, orig_model.speculative.draft_model, config_dir)
+
         for rt_name, rt in m.runtimes.items():
             orig_rt = orig_model.runtimes[rt_name]
-            if rt.source.local_path is not None:
-                is_rel = getattr(orig_rt.source, "_original_local_path_is_relative", False)
-                if is_rel:
-                    lp = rt.source.local_path.resolve().absolute()
-                    import os
-                    rt.source.local_path = Path(os.path.relpath(lp, config_dir))
-            if rt.mmproj is not None and rt.mmproj.local_path is not None:
-                is_rel = getattr(orig_rt.mmproj, "_original_local_path_is_relative", False)
-                if is_rel:
-                    lp = rt.mmproj.local_path.resolve().absolute()
-                    import os
-                    rt.mmproj.local_path = Path(os.path.relpath(lp, config_dir))
-            if (
-                rt.speculative.draft_model is not None
-                and rt.speculative.draft_model.local_path is not None
-            ):
-                is_rel = getattr(
-                    orig_rt.speculative.draft_model,
-                    "_original_local_path_is_relative",
-                    False,
-                )
-                if is_rel:
-                    lp = rt.speculative.draft_model.local_path.resolve().absolute()
-                    import os
-                    rt.speculative.draft_model.local_path = Path(
-                        os.path.relpath(lp, config_dir)
-                    )
+            _serialize_source(rt.source, orig_rt.source, config_dir)
+            _serialize_source(rt.mmproj, orig_rt.mmproj, config_dir)
+            _serialize_source(rt.vae, orig_rt.vae, config_dir)
+            _serialize_source(rt.clip_l, orig_rt.clip_l, config_dir)
+            _serialize_source(rt.t5xxl, orig_rt.t5xxl, config_dir)
+            _serialize_source(rt.clip_vision, orig_rt.clip_vision, config_dir)
+            _serialize_source(rt.control_net, orig_rt.control_net, config_dir)
+            _serialize_source(rt.speculative.draft_model, orig_rt.speculative.draft_model, config_dir)
+
     path.write_text(config_copy.model_dump_json(indent=2, exclude_unset=True))
 
 

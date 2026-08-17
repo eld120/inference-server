@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-import re
 
 import docker.errors
 import docker.models.containers
@@ -56,10 +56,38 @@ class RuntimeContainer:
         self.model_path: Path | None = None
         self.draft_model_path: Path | None = None
         self.mmproj_path: Path | None = None
+        self.vae_path: Path | None = None
+        self.clip_l_path: Path | None = None
+        self.t5xxl_path: Path | None = None
+        self.clip_vision_path: Path | None = None
+        self.control_net_path: Path | None = None
         self._recent_logs: list[str] = []
         self._last_persisted_log_blob: str | None = None
         self._last_persisted_log_blob_by_model: dict[str, str] = {}
         self.started_at: datetime | None = None
+
+    def is_sd_runtime(self) -> bool:
+        if self.config.task in {"image_generation", "image_edit", "video_generation"}:
+            return True
+        rt = self.runtime_type.lower()
+        if "sd" in rt or "diffusion" in rt:
+            return True
+        img = self.docker_image.lower()
+        if "sd" in img or "diffusion" in img:
+            return True
+        return False
+
+    def _to_container_path(self, host_path: Path, volumes: dict[str, Any]) -> str:
+        host_p = host_path.resolve().absolute()
+        cache_dir = self.manager._hf.cache_dir.resolve().absolute()
+        if host_p.is_relative_to(cache_dir):
+            rel = host_p.relative_to(cache_dir)
+            return f"/huggingface/{rel}"
+        parent = host_p.parent
+        suffix = self.manager._dir_hash(parent)
+        bind_path = f"/local_models_{suffix}"
+        volumes[str(parent)] = {"bind": bind_path, "mode": "ro"}
+        return f"{bind_path}/{host_p.name}"
 
     @property
     def model_name(self) -> str | None:
@@ -76,6 +104,11 @@ class RuntimeContainer:
         self.model_path = None
         self.draft_model_path = None
         self.mmproj_path = None
+        self.vae_path = None
+        self.clip_l_path = None
+        self.t5xxl_path = None
+        self.clip_vision_path = None
+        self.control_net_path = None
         self.last_error = None
 
     @property
@@ -118,79 +151,109 @@ class RuntimeContainer:
         self.state = "starting"
         self.last_error = None
         try:
-            # 1. Generate models preset INI file on host
-            ini_content = await self.manager._generate_presets_ini(
-                self.runtime_type,
-                active_model_name=self.model_name,
-                active_model_resolved_path=self.model_path,
-                active_model_draft_resolved_path=self.draft_model_path,
-                active_model_mmproj_resolved_path=self.mmproj_path,
-            )
-            ini_dir = self.manager._hf.cache_dir / "presets"
-            await asyncio.to_thread(ini_dir.mkdir, parents=True, exist_ok=True)
-            ini_path = ini_dir / f"{self.runtime_type}.ini"
-            await asyncio.to_thread(ini_path.write_text, ini_content)
-
             await self._ensure_image_pulled()
 
-            # 2. Gather volume bindings (always mount HF cache and local parents)
-            volumes = {
+            # Gather volume bindings (always mount HF cache)
+            volumes: dict[str, Any] = {
                 str(self.manager._hf.cache_dir.resolve().absolute()): {
                     "bind": "/huggingface",
                     "mode": "ro",
                 }
             }
-            # Mount host directory containing presets
-            volumes[str(ini_dir.resolve().absolute())] = {
-                "bind": "/config",
-                "mode": "ro",
-            }
 
-            for m in self.manager._config.models:
-                try:
-                    rt_cfg = self.manager._resolve_runtime_config(m, self.runtime_type)
-                except ValueError:
-                    continue
-                if rt_cfg.source.local_path is not None:
-                    local_p = Path(rt_cfg.source.local_path).resolve().absolute()
-                    cache_dir = self.manager._hf.cache_dir.resolve().absolute()
-                    if not local_p.is_relative_to(cache_dir):
-                        parent = local_p.parent
-                        suffix = self.manager._dir_hash(parent)
-                        bind_path = f"/local_models_{suffix}"
-                        volumes[str(parent)] = {
-                            "bind": bind_path,
-                            "mode": "ro",
-                        }
-                if (
-                    rt_cfg.speculative.draft_model is not None
-                    and rt_cfg.speculative.draft_model.local_path is not None
-                ):
-                    local_p = (
-                        Path(rt_cfg.speculative.draft_model.local_path)
-                        .resolve()
-                        .absolute()
-                    )
-                    cache_dir = self.manager._hf.cache_dir.resolve().absolute()
-                    if not local_p.is_relative_to(cache_dir):
-                        parent = local_p.parent
-                        suffix = self.manager._dir_hash(parent)
-                        bind_path = f"/local_models_{suffix}"
-                        volumes[str(parent)] = {
-                            "bind": bind_path,
-                            "mode": "ro",
-                        }
-                if rt_cfg.mmproj is not None and rt_cfg.mmproj.local_path is not None:
-                    local_p = Path(rt_cfg.mmproj.local_path).resolve().absolute()
-                    cache_dir = self.manager._hf.cache_dir.resolve().absolute()
-                    if not local_p.is_relative_to(cache_dir):
-                        parent = local_p.parent
-                        suffix = self.manager._dir_hash(parent)
-                        bind_path = f"/local_models_{suffix}"
-                        volumes[str(parent)] = {
-                            "bind": bind_path,
-                            "mode": "ro",
-                        }
+            if self.is_sd_runtime():
+                # Build command for stable-diffusion.cpp sd-server
+                command = ["--host", "0.0.0.0", "--port", "8080"]
+                if self.model_path is not None:
+                    command.extend(["-m", self._to_container_path(self.model_path, volumes)])
+                if self.vae_path is not None:
+                    command.extend(["--vae", self._to_container_path(self.vae_path, volumes)])
+                if self.clip_l_path is not None:
+                    command.extend(["--clip_l", self._to_container_path(self.clip_l_path, volumes)])
+                if self.t5xxl_path is not None:
+                    command.extend(["--t5xxl", self._to_container_path(self.t5xxl_path, volumes)])
+                if self.clip_vision_path is not None:
+                    command.extend(["--clip_vision", self._to_container_path(self.clip_vision_path, volumes)])
+                if self.control_net_path is not None:
+                    command.extend(["--control-net", self._to_container_path(self.control_net_path, volumes)])
+                command.extend(self.shared_args)
+                command.extend(self.extra_args)
+            else:
+                # 1. Generate models preset INI file on host for llama-server
+                ini_content = await self.manager._generate_presets_ini(
+                    self.runtime_type,
+                    active_model_name=self.model_name,
+                    active_model_resolved_path=self.model_path,
+                    active_model_draft_resolved_path=self.draft_model_path,
+                    active_model_mmproj_resolved_path=self.mmproj_path,
+                )
+                ini_dir = self.manager._hf.cache_dir / "presets"
+                await asyncio.to_thread(ini_dir.mkdir, parents=True, exist_ok=True)
+                ini_path = ini_dir / f"{self.runtime_type}.ini"
+                await asyncio.to_thread(ini_path.write_text, ini_content)
+
+                # Mount host directory containing presets
+                volumes[str(ini_dir.resolve().absolute())] = {
+                    "bind": "/config",
+                    "mode": "ro",
+                }
+
+                for m in self.manager._config.models:
+                    try:
+                        rt_cfg = self.manager._resolve_runtime_config(m, self.runtime_type)
+                    except ValueError:
+                        continue
+                    if rt_cfg.source.local_path is not None:
+                        local_p = Path(rt_cfg.source.local_path).resolve().absolute()
+                        cache_dir = self.manager._hf.cache_dir.resolve().absolute()
+                        if not local_p.is_relative_to(cache_dir):
+                            parent = local_p.parent
+                            suffix = self.manager._dir_hash(parent)
+                            bind_path = f"/local_models_{suffix}"
+                            volumes[str(parent)] = {
+                                "bind": bind_path,
+                                "mode": "ro",
+                            }
+                    if (
+                        rt_cfg.speculative.draft_model is not None
+                        and rt_cfg.speculative.draft_model.local_path is not None
+                    ):
+                        local_p = (
+                            Path(rt_cfg.speculative.draft_model.local_path)
+                            .resolve()
+                            .absolute()
+                        )
+                        cache_dir = self.manager._hf.cache_dir.resolve().absolute()
+                        if not local_p.is_relative_to(cache_dir):
+                            parent = local_p.parent
+                            suffix = self.manager._dir_hash(parent)
+                            bind_path = f"/local_models_{suffix}"
+                            volumes[str(parent)] = {
+                                "bind": bind_path,
+                                "mode": "ro",
+                            }
+                    if rt_cfg.mmproj is not None and rt_cfg.mmproj.local_path is not None:
+                        local_p = Path(rt_cfg.mmproj.local_path).resolve().absolute()
+                        cache_dir = self.manager._hf.cache_dir.resolve().absolute()
+                        if not local_p.is_relative_to(cache_dir):
+                            parent = local_p.parent
+                            suffix = self.manager._dir_hash(parent)
+                            bind_path = f"/local_models_{suffix}"
+                            volumes[str(parent)] = {
+                                "bind": bind_path,
+                                "mode": "ro",
+                            }
+
+                # Start llama-server: load via --models-preset
+                command = [
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8080",
+                    "--models-preset",
+                    f"/config/{self.runtime_type}.ini",
+                ]
+                command.extend(self.shared_args)
 
             # Apply runtime specific custom mounts
             for src, dst in self.volumes.items():
@@ -200,17 +263,6 @@ class RuntimeContainer:
             # Port & GPU setups
             ports = {"8080/tcp": (self.bind_host, self.manager.runtime_port)}
             devices = [f"{d}:{d}" for d in self.devices]
-
-            # Start llama-server: load via --models-preset
-            command = [
-                "--host",
-                "0.0.0.0",
-                "--port",
-                "8080",
-                "--models-preset",
-                f"/config/{self.runtime_type}.ini",
-            ]
-            command.extend(self.shared_args)
 
             container_name = f"inference-server-runtime-{self.runtime_type}"
             await self.manager._remove_conflicting_container(container_name)
@@ -295,6 +347,9 @@ class RuntimeContainer:
         self.state = "stopped"
 
     async def load_model(self, name: str) -> None:
+        if self.is_sd_runtime():
+            # For sd-server, model is loaded at container boot via -m flag
+            return
         async with self.manager.create_proxy_client(self.base_url) as client:
             response = await client.post("/models/load", json={"model": name})
             if response.status_code != 200:
@@ -304,6 +359,8 @@ class RuntimeContainer:
         await self._wait_until_model_loaded(name)
 
     async def unload_model(self, name: str) -> None:
+        if self.is_sd_runtime():
+            return
         async with self.manager.create_proxy_client(self.base_url) as client:
             response = await client.post("/models/unload", json={"model": name})
             if response.status_code != 200:
@@ -365,6 +422,11 @@ class RuntimeContainer:
                     response = await client.get("/v1/models")
                     if response.status_code == 200:
                         return
+                    if self.is_sd_runtime():
+                        for probe_path in ("/health", "/props", "/sdapi/v1/txt2img", "/"):
+                            probe_resp = await client.get(probe_path)
+                            if probe_resp.status_code in {200, 404, 405}:
+                                return
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
             await asyncio.sleep(1)
@@ -374,6 +436,8 @@ class RuntimeContainer:
         raise TimeoutError(msg)
 
     async def _wait_until_model_loaded(self, name: str) -> None:
+        if self.is_sd_runtime():
+            return
         timeout_seconds = self.manager._runtime.model_load_timeout_seconds
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
@@ -429,6 +493,19 @@ class RuntimeContainer:
         )
 
     async def _probe_model_readiness(self, name: str) -> bool:
+        if self.is_sd_runtime():
+            try:
+                async with self.manager.create_proxy_client(self.base_url) as client:
+                    resp = await client.get("/v1/models")
+                    if resp.status_code == 200:
+                        return True
+                    resp = await client.get("/health")
+                    if resp.status_code in {200, 404}:
+                        return True
+            except Exception:
+                return False
+            return True
+
         try:
             async with self.manager.create_proxy_client(self.base_url) as client:
                 response = await client.post(
@@ -869,6 +946,12 @@ class ModelRuntimeManager:
             volumes=backend_cfg.volumes,
             shared_args=backend_cfg.shared_args,
             mmproj=model_config.mmproj,
+            vae=model_config.vae,
+            clip_l=model_config.clip_l,
+            t5xxl=model_config.t5xxl,
+            clip_vision=model_config.clip_vision,
+            control_net=model_config.control_net,
+            task=model_config.task,
             extra_args=model_config.extra_args,
             speculative=model_config.speculative,
             bind_host=backend_cfg.bind_host,
@@ -885,7 +968,7 @@ class ModelRuntimeManager:
     async def _resolve_runtime_artifacts(
         self,
         rt_cfg: RuntimeConfig,
-    ) -> tuple[Path, Path | None, Path | None]:
+    ) -> tuple[Path, Path | None, Path | None, Path | None, Path | None, Path | None, Path | None, Path | None]:
         try:
             model_path = await asyncio.to_thread(self._hf.resolve_source, rt_cfg.source)
         except Exception as exc:
@@ -919,10 +1002,50 @@ class ModelRuntimeManager:
                     f"'{repo_label}' ({rt_cfg.mmproj.label()}): {exc}"
                 ) from exc
 
+        vae_path: Path | None = None
+        if rt_cfg.vae is not None:
+            try:
+                vae_path = await asyncio.to_thread(self._hf.resolve_source, rt_cfg.vae)
+            except Exception as exc:
+                raise ValueError(f"failed to resolve VAE artifact: {exc}") from exc
+
+        clip_l_path: Path | None = None
+        if rt_cfg.clip_l is not None:
+            try:
+                clip_l_path = await asyncio.to_thread(self._hf.resolve_source, rt_cfg.clip_l)
+            except Exception as exc:
+                raise ValueError(f"failed to resolve CLIP-L artifact: {exc}") from exc
+
+        t5xxl_path: Path | None = None
+        if rt_cfg.t5xxl is not None:
+            try:
+                t5xxl_path = await asyncio.to_thread(self._hf.resolve_source, rt_cfg.t5xxl)
+            except Exception as exc:
+                raise ValueError(f"failed to resolve T5-XXL artifact: {exc}") from exc
+
+        clip_vision_path: Path | None = None
+        if rt_cfg.clip_vision is not None:
+            try:
+                clip_vision_path = await asyncio.to_thread(self._hf.resolve_source, rt_cfg.clip_vision)
+            except Exception as exc:
+                raise ValueError(f"failed to resolve CLIP-Vision artifact: {exc}") from exc
+
+        control_net_path: Path | None = None
+        if rt_cfg.control_net is not None:
+            try:
+                control_net_path = await asyncio.to_thread(self._hf.resolve_source, rt_cfg.control_net)
+            except Exception as exc:
+                raise ValueError(f"failed to resolve ControlNet artifact: {exc}") from exc
+
         return (
             Path(model_path).resolve().absolute(),
             None if draft_model_path is None else Path(draft_model_path).resolve().absolute(),
             None if mmproj_path is None else Path(mmproj_path).resolve().absolute(),
+            None if vae_path is None else Path(vae_path).resolve().absolute(),
+            None if clip_l_path is None else Path(clip_l_path).resolve().absolute(),
+            None if t5xxl_path is None else Path(t5xxl_path).resolve().absolute(),
+            None if clip_vision_path is None else Path(clip_vision_path).resolve().absolute(),
+            None if control_net_path is None else Path(control_net_path).resolve().absolute(),
         )
 
     async def load(self, name: str, runtime: str) -> ModelResource:
@@ -930,9 +1053,15 @@ class ModelRuntimeManager:
             model_cfg = self._get_model_config(name)
             rt_cfg = self._resolve_runtime_config(model_cfg, runtime)
 
-            model_path, draft_model_path, mmproj_path = (
-                await self._resolve_runtime_artifacts(rt_cfg)
-            )
+            resolved = await self._resolve_runtime_artifacts(rt_cfg)
+            model_path = resolved[0]
+            draft_model_path = resolved[1] if len(resolved) > 1 else None
+            mmproj_path = resolved[2] if len(resolved) > 2 else None
+            vae_path = resolved[3] if len(resolved) > 3 else None
+            clip_l_path = resolved[4] if len(resolved) > 4 else None
+            t5xxl_path = resolved[5] if len(resolved) > 5 else None
+            clip_vision_path = resolved[6] if len(resolved) > 6 else None
+            control_net_path = resolved[7] if len(resolved) > 7 else None
 
             if self._active_runtime is not None:
                 try:
@@ -947,6 +1076,12 @@ class ModelRuntimeManager:
             runtime_obj.model_path = model_path
             runtime_obj.draft_model_path = draft_model_path
             runtime_obj.mmproj_path = mmproj_path
+            runtime_obj.vae_path = vae_path
+            runtime_obj.clip_l_path = clip_l_path
+            runtime_obj.t5xxl_path = t5xxl_path
+            runtime_obj.clip_vision_path = clip_vision_path
+            runtime_obj.control_net_path = control_net_path
+
 
             self._active_runtime = runtime_obj
             self._active_model_name = None

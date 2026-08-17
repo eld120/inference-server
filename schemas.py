@@ -146,6 +146,12 @@ class RuntimeConfig(BaseModel):
     volumes: dict[str, str] = Field(default_factory=dict)
     shared_args: list[str] = Field(default_factory=list)
     mmproj: ModelSource | None = None
+    vae: ModelSource | None = None
+    clip_l: ModelSource | None = None
+    t5xxl: ModelSource | None = None
+    clip_vision: ModelSource | None = None
+    control_net: ModelSource | None = None
+    task: Literal["chat", "completion", "image_generation", "image_edit", "video_generation"] = "chat"
     extra_args: list[str] = Field(default_factory=list)
     speculative: SpeculativeConfig = Field(default_factory=SpeculativeConfig)
     bind_host: str = "127.0.0.1"
@@ -195,11 +201,18 @@ class ModelConfig(BaseModel):
     name: str
     source: ModelSource | None = None
     mmproj: ModelSource | None = None
+    vae: ModelSource | None = None
+    clip_l: ModelSource | None = None
+    t5xxl: ModelSource | None = None
+    clip_vision: ModelSource | None = None
+    control_net: ModelSource | None = None
+    task: Literal["chat", "completion", "image_generation", "image_edit", "video_generation"] = "chat"
     extra_args: list[str] = Field(default_factory=list)
     speculative: SpeculativeConfig = Field(default_factory=SpeculativeConfig)
-    runtimes: dict[Literal["rocm", "vulkan"], RuntimeConfig] = Field(
-        default_factory=dict
-    )
+    runtimes: dict[
+        Literal["rocm", "vulkan", "sd-rocm", "sd-vulkan"], RuntimeConfig
+    ] = Field(default_factory=dict)
+
 
     @model_validator(mode="before")
     @classmethod
@@ -407,9 +420,9 @@ class ModelsResponse(BaseModel):
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    backends: dict[Literal["rocm", "vulkan"], BackendConfig] = Field(
-        default_factory=dict
-    )
+    backends: dict[
+        Literal["rocm", "vulkan", "sd-rocm", "sd-vulkan"], BackendConfig
+    ] = Field(default_factory=dict)
     models: list[ModelConfig] = Field(default_factory=list)
     hf_cache_dir: Path = Field(
         default_factory=lambda: Path.home() / ".cache" / "huggingface" / "hub"
@@ -523,4 +536,38 @@ class HFCachedFile(BaseModel):
 class LoadModelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    runtime: Literal["rocm", "vulkan"]
+    runtime: Literal["rocm", "vulkan", "sd-rocm", "sd-vulkan"] = "rocm"
+
+
+
+class ImageData(BaseModel):
+    b64_json: str | None = None
+    url: str | None = None
+    revised_prompt: str | None = None
+
+
+class ImageGenerationRequest(BaseModel):
+    prompt: str
+    model: str | None = None
+    n: int = 1
+    quality: str = "standard"
+    response_format: Literal["url", "b64_json"] = "b64_json"
+    size: str = "1024x1024"
+    style: str | None = "vivid"
+    user: str | None = None
+
+
+class ImageGenerationResponse(BaseModel):
+    created: int = 0
+    data: list[ImageData] = Field(default_factory=list)
+
+
+class VideoGenerationRequest(BaseModel):
+    prompt: str
+    model: str | None = None
+    image: str | None = None
+    num_frames: int = 49
+    fps: int = 16
+    height: int = 720
+    width: int = 1280
+
